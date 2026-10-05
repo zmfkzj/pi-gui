@@ -1,0 +1,31 @@
+{
+  "name": "pi-gui",
+  "version": "0.1.0",
+  "description": "Give each Pi agent its own private KDE Wayland desktop through computer-use-mcp and Pi's built-in MCP",
+  "type": "module",
+  "license": "MIT",
+  "keywords": ["pi-package", "pi-extension", "computer-use", "mcp", "wayland", "kde"],
+  "files": ["src", "bin", "README.md"],
+  "pi": {
+    "extensions": ["./src/index.ts"],
+    "skills": ["./node_modules/@mirsella/opencode-computer-use-mcp/skills"]
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --test 'test/*.test.ts'",
+    "test:gui": "node test/integration/gui.integration.ts"
+  },
+  "optionalDependencies": {
+    "@mirsella/opencode-computer-use-mcp": "0.6.0"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "1.0.2",
+    "@earendil-works/pi-coding-agent": "1.0.2",
+    "@types/node": "^22.19.19",
+    "typescript": "^6.0.2"
+  },
+  "engines": { "node": ">=22.19.0" }
+}

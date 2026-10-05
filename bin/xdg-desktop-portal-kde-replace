@@ -1,0 +1,9 @@
+#!/bin/sh
+# Start the KDE portal backend with --replace (pi-gui passes this script to computer-use-mcp's private-session runner
+# as COMPUTER_USE_MCP_PORTAL_BACKEND_BIN and the real program as PI_GUI_PORTAL_BACKEND).
+#
+# On the private session bus, D-Bus activation can start a backend before the runner does: KWin's Qt platform
+# registers with the portal at startup, which activates xdg-desktop-portal and its KDE backend. The runner's own start
+# then cannot take the bus name and the session fails with "portal_backend exited during startup". --replace takes the
+# name over. Every process of the private session, the activated one included, is stopped at teardown.
+exec "${PI_GUI_PORTAL_BACKEND:?pi-gui: PI_GUI_PORTAL_BACKEND is not set}" --replace "$@"
