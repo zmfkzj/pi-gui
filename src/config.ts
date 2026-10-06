@@ -26,6 +26,8 @@ export interface GuiConfig {
   timeoutSeconds: number;
   /** Extra environment for the server. Physical-session variables are removed afterwards in private mode. */
   env: Record<string, string>;
+  /** `/gui view` server (KDE's krdp). null: `krdpserver` on PATH, then /usr/bin/krdpserver. */
+  viewerCommand: string | null;
 }
 
 export const DEFAULT_GUI_CONFIG: Readonly<GuiConfig> = Object.freeze({
@@ -39,11 +41,12 @@ export const DEFAULT_GUI_CONFIG: Readonly<GuiConfig> = Object.freeze({
   allowPhysicalDesktop: false,
   timeoutSeconds: 150,
   env: {},
+  viewerCommand: null,
 });
 
 export const CONFIG_FILE = "gui.config.json";
 /** Keys a project file may not set: they decide which program runs and whether the physical desktop is reachable. */
-const USER_ONLY_KEYS: ReadonlySet<string> = new Set(["allowPhysicalDesktop", "command", "args", "env"]);
+const USER_ONLY_KEYS: ReadonlySet<string> = new Set(["allowPhysicalDesktop", "command", "args", "env", "viewerCommand"]);
 
 export interface LoadedGuiConfig {
   config: GuiConfig;
@@ -78,6 +81,7 @@ export function validateGuiConfig(value: unknown, options: { project?: boolean }
         expected = "a boolean";
         break;
       case "command":
+      case "viewerCommand":
         valid = entry === null || (typeof entry === "string" && entry.trim().length > 0);
         expected = "a non-empty string or null";
         break;

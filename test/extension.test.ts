@@ -1,7 +1,8 @@
 // Real Pi sessions (SDK, faux model) with Pi's own MCP extension and a fake computer-use-mcp: the routing hook, the
 // server environment, the worker capability and the process lifecycle go through Pi's actual pipeline.
 import assert from "node:assert/strict";
-import { mkdtemp } from "node:fs/promises";
+import { existsSync, readFileSync } from "node:fs";
+import { mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
@@ -170,4 +171,89 @@ test("worker capability is refused with the reason when prerequisites are missin
   let answer: unknown;
   api!.events.emit(CAPABILITY_CHANNEL, { capability: "gui", cwd: process.cwd(), provide: (value: unknown) => { answer = value; } });
   assert.match((answer as { error: string }).error, /missing kwin_wayland/);
+});
+
+const fakeKrdpScript = fileURLToPath(new URL("./fixtures/fake-krdpserver.mjs", import.meta.url));
+const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+const isAlive = (pid: number) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+
+test("/gui view: a worker's private desktop over loopback RDP, stopped with the worker", { skip: !existsSync("/usr/bin/openssl") && "openssl not installed" }, async () => {
+  const bin = await mkdtemp(join(tmpdir(), "pi-gui-krdp-"));
+  const record = join(bin, "record.json");
+  const krdp = join(bin, "krdpserver");
+  await writeFile(krdp, `#!/bin/sh\nexport FAKE_KRDP_RECORD=${JSON.stringify(record)}\nexec ${JSON.stringify(process.execPath)} ${JSON.stringify(fakeKrdpScript)} "$@"\n`, { mode: 0o755 });
+  const viewerReady = () => ({ ok: true, checks: [], missing: [], krdp, openssl: "/usr/bin/openssl" });
+  let api: ExtensionAPI | undefined;
+  const cfg = await mkdtemp(join(tmpdir(), "pi-gui-cfg-"));
+  const main = await startSession([
+    noMcpJson(), pi => { api = pi; },
+    createGuiExtension({ agentDir: cfg, resolve: resolveFake, prerequisites: ready, viewer: { prerequisites: viewerReady } }),
+  ], []);
+  const notes: { text: string; level?: string }[] = [];
+  const gui = main.session.extensionRunner.getCommand("gui")!;
+  const ctx = { hasUI: true, ui: { notify: (text: string, level?: string) => notes.push({ text, level }) } } as unknown as Parameters<typeof gui.handler>[1];
+  const command = async (args: string) => { notes.length = 0; await gui.handler(args, ctx); return notes.at(-1)!; };
+
+  const provide = () => {
+    let answer: CapabilityProvider | undefined;
+    api!.events.emit(CAPABILITY_CHANNEL, { capability: "gui", cwd: process.cwd(), workerId: "W1", provide: (value: CapabilityProvider) => { answer = value; } });
+    return answer!;
+  };
+  const provider = provide();
+  assert.equal(provider.key, provide().key, "the per-worker view tag is not part of the key: reused workers keep their desktop");
+  assert.match((await command("view")).text, /W1|no GUI|main/, "before the worker exists only the main session is listed");
+  const worker = await startSession(provider.extensionFactories, [
+    call("mcp__computer_use__launch_application", { desktop_id: "org.kde.kwrite.desktop" }),
+    fauxAssistantMessage("done"),
+  ], { tools: ["read", ...provider.tools] });
+  assert.match((await command("view list")).text, /main, W1/);
+  assert.match((await command("view W1")).text, /has not started yet/, "no desktop before the worker's first GUI call");
+  await worker.session.prompt("launch");
+
+  const opened = await command("view");
+  assert.equal(opened.level, "info", opened.text);
+  const port = Number(/127\.0\.0\.1:(\d+)/.exec(opened.text)?.[1]);
+  const password = /Password:\s+(\S+)/.exec(opened.text)?.[1];
+  assert.ok(port > 0 && password, opened.text);
+  assert.match(opened.text, /W1's private desktop wayland-virtual-\d+/);
+  const seen = JSON.parse(readFileSync(record, "utf8"));
+  assert.equal(seen.options.address, "127.0.0.1");
+  assert.equal(seen.options.port, String(port));
+  assert.equal(seen.options.password, password);
+  assert.match(seen.env.XDG_RUNTIME_DIR, /computer-use-mcp-isolated-/, "the viewer joined the worker's private session");
+  assert.match(seen.env.WAYLAND_DISPLAY, /^wayland-virtual-\d+$/);
+  assert.equal(seen.env.DISPLAY, null);
+  const again = await command("view W1");
+  assert.match(again.text, /Already running/);
+  assert.ok(again.text.includes(`127.0.0.1:${port}`) && again.text.includes(password!), "the same connection again");
+  assert.match((await command("status")).text, new RegExp(`W1 \\(viewer on 127\\.0\\.0\\.1:${port}\\)`));
+  assert.doesNotMatch(readFileSync(join(cfg, "gui.log"), "utf8"), new RegExp(password!), "the password is not logged");
+  assert.match(readFileSync(join(cfg, "gui.log"), "utf8"), /view W1: krdp pid \d+ listening on 127\.0\.0\.1:\d+/);
+
+  // Stop and reopen: a new port and password; then the worker ends and takes its viewer with it.
+  assert.match((await command("view stop")).text, /Stopped the viewer of W1/);
+  assert.equal(isAlive(seen.pid), false);
+  const reopened = await command("view W1");
+  assert.match(reopened.text, /Started a remote desktop/);
+  const second = JSON.parse(readFileSync(record, "utf8"));
+  assert.notEqual(second.options.password, password, "a new password per viewer");
+  await shutdown(worker.session);
+  const deadline = Date.now() + 5_000;
+  while (isAlive(second.pid) && Date.now() < deadline) await sleep(50);
+  assert.equal(isAlive(second.pid), false, "the worker's session shutdown stopped its viewer");
+  assert.equal(existsSync(second.env.TMPDIR), false, "its certificate directory is gone");
+  assert.match((await command("view W1")).text, /no GUI desktop named "W1"/);
+});
+
+test("/gui view: missing krdp gives the install command", async () => {
+  const missing = () => ({ ok: false, checks: [{ name: "krdpserver (KDE RDP server)", ok: false, detail: "not found", apt: "krdp" }], missing: ["krdpserver (KDE RDP server) (apt: krdp)"] });
+  const { session } = await startSession([
+    noMcpJson(),
+    createGuiExtension({ agentDir: await mkdtemp(join(tmpdir(), "pi-gui-cfg-")), resolve: resolveFake, prerequisites: ready, viewer: { prerequisites: missing } }),
+  ], []);
+  const notes: { text: string; level?: string }[] = [];
+  const gui = session.extensionRunner.getCommand("gui")!;
+  await gui.handler("view main", { hasUI: true, ui: { notify: (text: string, level?: string) => notes.push({ text, level }) } } as unknown as Parameters<typeof gui.handler>[1]);
+  assert.equal(notes.at(-1)!.level, "error");
+  assert.match(notes.at(-1)!.text, /sudo apt install krdp/);
 });

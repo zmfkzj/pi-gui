@@ -13,7 +13,8 @@
   "scripts": {
     "typecheck": "tsc --noEmit",
     "test": "node --test 'test/*.test.ts'",
-    "test:gui": "node test/integration/gui.integration.ts"
+    "test:gui": "node test/integration/gui.integration.ts",
+    "test:view": "node test/integration/view.integration.ts"
   },
   "optionalDependencies": {
     "@mirsella/opencode-computer-use-mcp": "0.6.0"

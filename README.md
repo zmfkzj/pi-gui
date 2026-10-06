@@ -211,3 +211,56 @@ npm run test:gui    # live tests on real private desktops (needs the desktop ser
 - Cleanup: nothing outlives its session.
 
 Screenshots go to `$TMPDIR/pi-gui-live/`.
+
+## Viewing a private desktop yourself (`/gui view`)
+
+Private desktops are invisible by design. When a worker is stuck at a step only you can do (OAuth sign-in, 2FA code,
+CAPTCHA, consent screen), you can open its desktop over RDP, operate it, and hand it back.
+
+```
+/gui view [name]          start (or show again) a viewer; name = W1, W2, … or main; omitted = the only GUI worker
+/gui view stop [name|all] stop it (omitted = the only running viewer)
+/gui view list            desktops and running viewers
+```
+
+Procedure (worker stuck at a sign-in):
+
+1. The worker ends its assignment reporting that user sign-in is needed (its instructions say so; it leaves the app on
+   that screen). It is now idle: give it no assignment while you operate its desktop.
+2. `/gui view W1` prints `127.0.0.1:<port>`, user `pi`, a one-time password and the certificate's SHA-256 fingerprint.
+3. Connect with an RDP client that decodes H.264, e.g.
+   `xfreerdp3 /v:127.0.0.1:<port> /u:pi /sec:tls /gfx:avc420 /cert:fingerprint:sha256:<hex>` (asks for the password), or
+   Remmina (snap/Flatpak): RDP profile, server `127.0.0.1:<port>`, user `pi`, security TLS, check the fingerprint.
+4. Sign in on the worker's desktop.
+5. `/gui view stop W1`, then continue with `orche_task worker: "W1"`: same session, same desktop, same signed-in apps.
+   orche retires an idle worker after 30 minutes (its desktop and viewer go with it), so finish within that time.
+
+How it works: the server is KDE's `krdpserver` (krdp), started with the private session's own environment
+(`XDG_RUNTIME_DIR=/tmp/computer-use-mcp-isolated-*`, `WAYLAND_DISPLAY=wayland-virtual-*`, its D-Bus, PipeWire and portal)
+and without any physical-session variable. pi-gui finds that session through the server's process tree: every server gets
+a random `PI_GUI_VIEW_TAG`, inherited by its private session; only descendants of this Pi process that carry the tag and
+the runner's verified 0700 runtime directory (readiness marker, Wayland and bus sockets) count. krdp captures and injects
+through the private session's xdg-desktop-portal RemoteDesktop, which the runner (and pi-gui, for krdp's app IDs)
+pre-authorizes on the private bus only, so no consent dialog appears and the physical session's permissions are untouched.
+The viewer carries the runner's isolation marker, so the runner's teardown stops it too; pi-gui stops it on
+`/gui view stop`, when the worker's session ends (orche's idle retirement included), on main-session shutdown and on exit.
+A second `/gui view` shows the running viewer again; if the worker's desktop was replaced, the viewer is restarted on the new one.
+
+Why krdp: KWin offers no wlr screencopy/virtual-pointer protocols (wayvnc cannot work), krfb always listens on 0.0.0.0,
+and gnome-remote-desktop needs Mutter. krdp listens on a chosen address and works through the portal.
+
+Requirements: `sudo apt install krdp openssl` (or set `"viewerCommand"` in `~/.pi/agent/gui.config.json`, user config
+only). Clients: krdp streams only H.264 (AVC420). Ubuntu's FreeRDP 3 packages are built without H.264
+(`WITH_GFX_H264=OFF`), and so are the apt Remmina/KRDC that use them; use the snap/Flatpak Remmina, Flatpak
+`com.freerdp.FreeRDP`, or another H.264-capable client. `/gui doctor` checks krdp, openssl and the clients it finds.
+
+Security:
+- Loopback only (`--address=127.0.0.1`), a free port picked per start, user `pi`, a random 20-character password per
+  viewer (new on every start), TLS with a fresh self-signed certificate whose fingerprint is printed so you can pin it.
+- The password is shown only in the `/gui view` output. It is never written to `gui.log` or any file (server output is
+  redacted). krdp takes it as a command-line argument, so local processes can read it from the process list while the
+  viewer runs: anyone with a shell on this machine could connect. Stop the viewer when you are done.
+- The certificate and key live in a 0700 directory inside the private runtime directory and are deleted with the viewer.
+- Whoever connects controls the worker's desktop, with your files and network. Do not share the connection details.
+- While you operate the desktop the worker can still act on it if you give it an assignment; give it none until you stop.
+

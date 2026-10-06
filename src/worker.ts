@@ -3,6 +3,7 @@ import { SERVER_NAME, serverToolOf, toolNames, type McpStdioServerConfig } from 
 import type { ToolMode } from "./config.ts";
 import type { GuiLog } from "./log.ts";
 import { routeToolCall, sessionOf, type PolicyOptions } from "./policy.ts";
+import type { ViewRegistry } from "./viewer.ts";
 
 /**
  * Worker capability contract (orche): orche emits `{ capability, cwd, workerId, provide }` on `pi.events` when a task
@@ -35,14 +36,30 @@ export function isCapabilityRequest(value: unknown): value is CapabilityRequest 
   return !!request && typeof request.capability === "string" && typeof request.provide === "function";
 }
 
+/** orche's worker transcript: `<records>/<session>/workers/<id>-<spawn time>.jsonl`. */
+export function workerIdOfSessionFile(file: string | undefined): string | undefined {
+  return file ? /(?:^|\/)workers\/(W\d+)-[^/]*\.jsonl$/.exec(file)?.[1] : undefined;
+}
+
 /**
  * The GUI part of one session: registers this session's own computer-use server (Pi's MCP extension spawns, owns and
- * stops its process; nothing here manages processes) and routes calls to the private desktop.
+ * stops its process; nothing here manages processes) and routes calls to the private desktop. With `view`, the server
+ * is listed for `/gui view` while the session lives; its viewer stops with the session.
  */
-export function guiSessionExtension(options: { server: McpStdioServerConfig; policy: PolicyOptions; log: GuiLog; label: string }): ExtensionFactory {
+export function guiSessionExtension(options: {
+  server: McpStdioServerConfig; policy: PolicyOptions; log: GuiLog; label: string;
+  view?: { registry: ViewRegistry; name: string; tag: string };
+}): ExtensionFactory {
   return (pi: ExtensionAPI) => {
     pi.registerMcpServer(SERVER_NAME, options.server);
     options.log.write(`registered ${SERVER_NAME} MCP (${options.label})`);
+    const view = options.view;
+    if (view) view.registry.register(view.name, view.tag);
+    pi.on("session_start", (_event, ctx) => {
+      // orche names the worker before it is spawned; its transcript name is authoritative when there is one.
+      const id = workerIdOfSessionFile(ctx.sessionManager.getSessionFile());
+      if (view) view.registry.register(id ?? view.name, view.tag);
+    });
     let session: string | undefined;
     pi.on("tool_call", event => {
       const tool = serverToolOf(event.toolName);
@@ -61,7 +78,10 @@ export function guiSessionExtension(options: { server: McpStdioServerConfig; pol
       }
       return undefined;
     });
-    pi.on("session_shutdown", () => { options.log.write(`session shutdown${session ? ` (${session})` : ""}`); });
+    pi.on("session_shutdown", async () => {
+      options.log.write(`session shutdown${session ? ` (${session})` : ""}`);
+      if (view) await view.registry.release(view.tag);
+    });
   };
 }
 
@@ -75,6 +95,7 @@ export function workerInstructions(mode: ToolMode): string {
     `Private GUI desktop: ${tools} operate a KDE Wayland desktop of your own. The user does not see it; it is not their screen, and other workers have their own.`,
     `${howTo} Typical flow: list_desktop {scope: "applications"} → launch_application {desktop_id} → list_desktop {scope: "windows"} until the window is listed (windows are found through accessibility; window_opened waits need compositor app IDs, which KWin may not provide) → observe {target, view: "both"} → act → observe again. Copy returned IDs unchanged.`,
     "Apps there run as the user with the user's files and network: stay within the assignment, and report GUI evidence (what you observed) in your result.",
+    "When a step needs the user (a sign-in, 2FA code, CAPTCHA or consent screen), do not guess credentials or work around it: leave the app on that screen and end the assignment, reporting that user sign-in is needed on this desktop. The user can open it with /gui view and then reuse you with the same desktop.",
   ].join("\n");
 }
 
