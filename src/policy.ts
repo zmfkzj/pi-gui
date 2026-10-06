@@ -73,3 +73,16 @@ export function sessionOf(content: readonly { type: string; text?: string }[]): 
   }
   return undefined;
 }
+
+export const GUIDANCE_SECTION = "pi-gui";
+
+/**
+ * The main session's system prompt section: what the computer-use tools reach. `physical` when tools of another extension
+ * that controls the user's own screen (`computer_use_*`, e.g. @amaster.ai/pi-computer-use) are registered too.
+ */
+export function desktopGuidance(physical: boolean): string {
+  return [
+    "GUI: the mcp__computer_use__* tools operate your own private desktop, a separate KDE Wayland session that the user does not see. Use it for GUI work; tell the user what you observed there, since they cannot see it.",
+    ...(physical ? ["Tools named computer_use_* (without the mcp__ prefix) control the user's physical screen and apps. Use them only when the user explicitly asks you to act on their own screen."] : []),
+  ].join(" ");
+}

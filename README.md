@@ -101,6 +101,14 @@ desktop.
 
 Every MCP call goes through Pi's tool pipeline, so permission extensions see these tools with upstream's annotations.
 
+**Next to a physical-desktop extension.** oh-my-pi-extensions also bundles
+[@amaster.ai/pi-computer-use](https://www.npmjs.com/package/@amaster.ai/pi-computer-use), whose `computer_use_*` tools
+control the user's own screen. pi-gui leaves it alone. While its server is registered, pi-gui adds a short system prompt
+section saying which screen each tool reaches: `mcp__computer_use__*` is the agent's private desktop, which the user
+does not see, and `computer_use_*` (mentioned only when such tools exist) is the user's screen, used only on explicit
+request. orche workers load neither the physical-desktop extension nor this section; their instructions come with the
+`gui` capability.
+
 ## Configuration
 
 `~/.pi/agent/gui.config.json`, optionally overridden key by key by a trusted project's `.pi/gui.config.json` (which may not

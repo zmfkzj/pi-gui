@@ -5,7 +5,7 @@ import {
 } from "./backend.ts";
 import { DEFAULT_GUI_CONFIG, loadGuiConfig, type LoadedGuiConfig } from "./config.ts";
 import { GuiLog } from "./log.ts";
-import { routeToolCall, sessionOf } from "./policy.ts";
+import { desktopGuidance, GUIDANCE_SECTION, routeToolCall, sessionOf } from "./policy.ts";
 import {
   backendVersion, checkPrerequisites, doctorStatuses, privateDesktopSmoke, upstreamDoctor, type PrerequisiteReport,
 } from "./prerequisites.ts";
@@ -103,6 +103,15 @@ export function createGuiExtension(options: GuiExtensionOptions = {}) {
 
     pi.on("session_start", async (_event, ctx) => { await setup(ctx); });
     pi.on("session_shutdown", () => { stopPoll(); if (registered) log.write("session shutdown"); registered = false; context = undefined; });
+
+    // Which screen a tool reaches. Direct-exposure MCP servers are not described in the system prompt, and other
+    // extensions (e.g. @amaster.ai/pi-computer-use, `computer_use_*`) may control the user's physical desktop next to us.
+    pi.on("before_agent_start", event => {
+      const { sections } = event.systemPromptOptions;
+      if (!registered) { delete sections[GUIDANCE_SECTION]; return; }
+      const physical = pi.getAllTools().some(tool => /^computer_use_/.test(tool.name) && tool.exposure !== "hidden");
+      sections[GUIDANCE_SECTION] = desktopGuidance(physical);
+    });
 
     // Desktop routing for this session's own server (worker sessions install the same hook through guiSessionExtension).
     pi.on("tool_call", event => {

@@ -8,7 +8,7 @@ import {
   type Backend,
 } from "../src/backend.ts";
 import { DEFAULT_GUI_CONFIG, loadGuiConfig, validateGuiConfig } from "../src/config.ts";
-import { routeToolCall, sessionOf } from "../src/policy.ts";
+import { desktopGuidance, routeToolCall, sessionOf } from "../src/policy.ts";
 import { checkPrerequisites, doctorStatuses, KWIN_PLUGINS, PORTAL_BACKEND_WRAPPER, RUNNER_PROGRAMS } from "../src/prerequisites.ts";
 
 const config = (patch = {}) => ({ ...DEFAULT_GUI_CONFIG, env: {}, ...patch });
@@ -107,6 +107,12 @@ test("policy: private desktop by default, foreground refused unless opted in", (
   routeToolCall("list_desktop", implicit, optedIn);
   assert.equal(implicit.desktop, "background", "even with the opt-in, the private desktop stays the default");
   assert.match(routeToolCall("list_desktop", { desktop: "elsewhere" }, optedIn)!, /not available/);
+});
+
+test("guidance names the physical-screen tools only when they exist", () => {
+  assert.match(desktopGuidance(false), /private desktop/);
+  assert.doesNotMatch(desktopGuidance(false), /physical/);
+  assert.match(desktopGuidance(true), /only when the user explicitly asks you to act on their own screen/);
 });
 
 test("sessionOf reads only upstream's header line", () => {

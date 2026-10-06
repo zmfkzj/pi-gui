@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
 import { fileURLToPath } from "node:url";
+import { Type } from "typebox";
 import { fauxAssistantMessage, fauxProvider, fauxToolCall, InMemoryCredentialStore, type FauxResponseStep } from "@earendil-works/pi-ai";
 import {
   createAgentSession, createMcpExtension, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager,
@@ -90,6 +91,28 @@ test("main session: private desktop by default, sanitized server environment, fo
   assert.match(foreground!.text, /private desktop/);
   assert.equal(idle!.isError, true);
   assert.match(idle!.text, /human_idle/);
+});
+
+test("main session: the system prompt says which screen each computer-use tool reaches", async () => {
+  // A stand-in for @amaster.ai/pi-computer-use: a tool that controls the user's physical screen.
+  const physicalTool: ExtensionFactory = pi => pi.registerTool({
+    name: "computer_use_click", label: "click", description: "Click on the user's screen", parameters: Type.Object({}),
+    execute: async () => ({ content: [{ type: "text", text: "clicked" }], details: undefined }),
+  });
+  const prompt = async (factories: ExtensionFactory[], prerequisites = ready) => {
+    const { session } = await startSession([noMcpJson(), ...factories,
+      createGuiExtension({ agentDir: await mkdtemp(join(tmpdir(), "pi-gui-cfg-")), resolve: resolveFake, prerequisites })], [fauxAssistantMessage("ok")]);
+    await session.prompt("hello");
+    return JSON.stringify(session.messages) + session.systemPrompt;
+  };
+  const both = await prompt([physicalTool]);
+  assert.match(both, /mcp__computer_use__\* tools operate your own private desktop/);
+  assert.match(both, /computer_use_\* \(without the mcp__ prefix\) control the user's physical screen/);
+  const alone = await prompt([]);
+  assert.match(alone, /operate your own private desktop/);
+  assert.doesNotMatch(alone, /physical screen/);
+  const unavailable = await prompt([physicalTool], () => ({ ok: false, checks: [], missing: ["kwin_wayland (apt: kwin-wayland)"], overrides: {}, host: "test" }));
+  assert.doesNotMatch(unavailable, /private desktop/, "no guidance without a registered server");
 });
 
 test("worker capability: one server process per worker session, stopped with its session", async () => {
