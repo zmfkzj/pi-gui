@@ -230,7 +230,13 @@ Procedure (worker stuck at a sign-in):
 2. `/gui view W1` prints `127.0.0.1:<port>`, user `pi`, a one-time password and the certificate's SHA-256 fingerprint.
 3. Connect with an RDP client that decodes H.264, e.g.
    `xfreerdp3 /v:127.0.0.1:<port> /u:pi /sec:tls /gfx:avc420 /cert:fingerprint:sha256:<hex>` (asks for the password), or
-   Remmina (snap/Flatpak): RDP profile, server `127.0.0.1:<port>`, user `pi`, security TLS, check the fingerprint.
+   Remmina (snap/Flatpak): RDP profile, server `127.0.0.1:<port>`, user `pi`, Advanced > Security protocol negotiation
+   "TLS protocol security", check the fingerprint. Not "Automatic" (NLA): krdp started with `--username/--password`
+   has no NTLM account database, so NLA logins always fail (client log: `ERRCONNECT_LOGON_FAILURE`) and the password
+   prompt comes back.
+   Two different failures: the password prompt coming straight back is the NLA problem above (fix the security setting);
+   signing in that then drops at once or shows no picture can mean the client cannot decode H.264 (see Clients below).
+   A dark screen alone does not prove a codec problem: the worker's desktop may simply be dark or idle.
 4. Sign in on the worker's desktop.
 5. `/gui view stop W1`, then continue with `orche_task worker: "W1"`: same session, same desktop, same signed-in apps.
    orche retires an idle worker after 30 minutes (its desktop and viewer go with it), so finish within that time.
@@ -250,9 +256,38 @@ Why krdp: KWin offers no wlr screencopy/virtual-pointer protocols (wayvnc cannot
 and gnome-remote-desktop needs Mutter. krdp listens on a chosen address and works through the portal.
 
 Requirements: `sudo apt install krdp openssl` (or set `"viewerCommand"` in `~/.pi/agent/gui.config.json`, user config
-only). Clients: krdp streams only H.264 (AVC420). Ubuntu's FreeRDP 3 packages are built without H.264
-(`WITH_GFX_H264=OFF`), and so are the apt Remmina/KRDC that use them; use the snap/Flatpak Remmina, Flatpak
-`com.freerdp.FreeRDP`, or another H.264-capable client. `/gui doctor` checks krdp, openssl and the clients it finds.
+only).
+
+Clients: krdp streams only H.264 (AVC420) over the RDP graphics pipeline and drops clients that cannot decode it
+(krdp's own message: "Client does not support H.264 in YUV420 mode!"). What matters is the client's FreeRDP build
+(`WITH_GFX_H264=ON` plus an H.264 decoder such as FFmpeg's libavcodec or OpenH264), not the Remmina version, and it
+differs per distribution, release and packaging, so check the build you have:
+
+- FreeRDP command-line clients: `xfreerdp3 /buildconfig | grep -o 'WITH_GFX_H264=[A-Z]*'`; `/gui doctor` runs this for
+  the `xfreerdp3`/`sdl-freerdp3`/`wlfreerdp3` it finds. For Remmina/KRDC it only reports whether a snap, apt or Flatpak
+  build is installed, not whether it decodes H.264.
+- apt Remmina/KRDC use the system `libfreerdp3`. Observed on Ubuntu 26.04 (Remmina 1.4.43, `libfreerdp3-3`
+  3.32.1+dfsg-0ubuntu0.26.04.1): `WITH_GFX_H264=OFF`, `WITH_FFMPEG=OFF` (Ubuntu builds FreeRDP without FFmpeg, see
+  `/usr/share/doc/libfreerdp3-3/changelog.Debian.gz`). With TLS set it got past sign-in and krdp then logged it off
+  during the capability exchange (`ERRINFO_LOGOFF_BY_USER`), consistent with the missing H.264. Other distributions or
+  releases may differ.
+- Remmina snap ([Snap Store](https://snapcraft.io/remmina), published by Remmina upstream) bundles its own FreeRDP.
+  Observed in `latest/stable` v1.4.43 (rev 7392): FreeRDP 3.14.1 with `WITH_GFX_H264=ON`, `WITH_FFMPEG=on`, linked to
+  a bundled `libavcodec.so.58`. Check the installed revision with
+  `strings /snap/remmina/current/usr/lib/libfreerdp3.so.3 | grep -o 'WITH_GFX_H264=[A-Z]*'`.
+  On the same machine the snap session stayed connected to krdp where the apt build was logged off; the picture
+  itself was not checked here, and other revisions or channels may be built differently.
+  Install ([Remmina install guide](https://remmina.org/how-to-install-remmina/#snap)): `sudo snap install remmina`.
+  If the apt Remmina is installed too, both are called `remmina`: start the snap explicitly with `snap run remmina`
+  (or `/snap/bin/remmina`, menu entry `remmina_remmina.desktop`); `which -a remmina` shows which one comes first.
+  The snap keeps its own profiles and certificates under `~/snap/remmina/`, so apt profiles are not visible there.
+  The guide's `sudo snap connect remmina:...` commands enable optional features (password storage via
+  `password-manager-service`, audio, printing, mounts, server discovery); none of them is about H.264 decoding.
+- Remmina Flatpak: the same install guide says to install `org.freedesktop.Platform.openh264` before
+  `org.remmina.Remmina` if you need H.264. Flatpak `com.freerdp.FreeRDP` or any other client whose FreeRDP has H.264
+  may also work; neither was checked here.
+
+`/gui doctor` checks krdp, openssl and lists the clients it finds.
 
 Security:
 - Loopback only (`--address=127.0.0.1`), a free port picked per start, user `pi`, a random 20-character password per

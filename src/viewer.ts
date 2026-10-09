@@ -587,9 +587,9 @@ export function connectionMessage(viewer: RunningViewer, kind: "started" | "runn
     `  User:      ${viewer.user}`,
     `  Password:  ${viewer.password}   (one-time, for this viewer only; not saved anywhere)`,
     `  TLS:       self-signed, SHA-256 ${viewer.fingerprint}`,
-    "Connect with an RDP client that decodes H.264 (krdp streams only H.264/AVC420; distribution FreeRDP builds, and the Remmina/KRDC that use them, may lack it: /gui doctor checks):",
+    "Connect with an RDP client that decodes H.264 (krdp streams only H.264/AVC420; distribution FreeRDP builds, and the Remmina/KRDC that use them, may lack it: /gui doctor checks FreeRDP command-line clients, README > Clients covers Remmina):",
     `  xfreerdp3 /v:${address} /u:${viewer.user} /sec:tls /gfx:avc420 /cert:fingerprint:sha256:${hex}   (FreeRDP with H.264; asks for the password)`,
-    `  Remmina (snap or Flatpak): new RDP profile, server ${address}, user ${viewer.user}, security "TLS"; accept the certificate whose fingerprint matches.`,
+    `  Remmina (snap: \`snap run remmina\`, or Flatpak with the openh264 extension): new RDP profile, server ${address}, user ${viewer.user}, Advanced > Security protocol negotiation "TLS protocol security" (not "Automatic"/NLA: krdp cannot check passwords over NLA, so every login fails and the password prompt returns); accept the certificate whose fingerprint matches.`,
     isWorker
       ? `While you operate the desktop, give ${viewer.target} no assignment. When done: /gui view stop ${viewer.target}, then continue with orche_task worker: "${viewer.target}" (same desktop, same signed-in apps).`
       : "While you operate the desktop, let this session's agent wait. When done: /gui view stop main.",

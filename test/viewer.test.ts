@@ -194,6 +194,8 @@ test("viewer arguments, password, fingerprint, tag and messages", () => {
   assert.match(text, /\/gui view stop W1/);
   assert.match(text, /orche_task worker: "W1"/);
   assert.match(text, /H\.264/);
+  assert.match(text, /Remmina.*"TLS protocol security".*not "Automatic"\/NLA/, "Remmina's default negotiation picks NLA, which krdp always refuses");
+  assert.match(text, /snap run remmina/, "names the snap build explicitly, so an apt Remmina without H.264 is not started by mistake");
   assert.equal(workerIdOfSessionFile("/r/abc/workers/W12-2026-10-06T12-30-33-963Z.jsonl"), "W12");
   assert.equal(workerIdOfSessionFile("/r/abc/sessions/main.jsonl"), undefined);
   assert.equal(workerIdOfSessionFile(undefined), undefined);
