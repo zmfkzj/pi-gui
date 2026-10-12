@@ -64,10 +64,15 @@ export function guiSessionExtension(options: {
       if (view) view.registry.register(id ?? view.name, view.tag);
     });
     let session: string | undefined;
+    const policy: PolicyOptions = {
+      ...options.policy,
+      ...(view ? { viewerRunning: () => view.registry.viewing(view.tag) } : {}),
+      log: line => options.log.write(line),
+    };
     pi.on("tool_call", event => {
       const tool = serverToolOf(event.toolName);
       if (!tool) return undefined;
-      const reason = routeToolCall(tool, event.input as Record<string, unknown>, options.policy);
+      const reason = routeToolCall(tool, event.input as Record<string, unknown>, policy);
       return reason ? { block: true, reason } : undefined;
     });
     pi.on("tool_result", event => {

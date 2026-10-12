@@ -482,6 +482,12 @@ export class ViewRegistry {
     return this.targets.get(name) ?? [...this.targets.values()].find(target => target.name.toLowerCase() === name.toLowerCase());
   }
 
+  /** Whether the server tagged `tag` has a viewer running now (started and not exited). */
+  viewing(tag: string): boolean {
+    const viewer = [...this.targets.values()].find(target => target.tag === tag)?.viewer;
+    return !!viewer && !viewer.exited;
+  }
+
   /** The target a command means: the named one, or the only GUI worker when no name is given. */
   resolve(name: string | undefined): { target: ViewTarget } | { error: string } {
     if (name) {

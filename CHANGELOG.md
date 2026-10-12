@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- An agent `act` paste while `/gui view` ran on the same desktop could freeze it for good: upstream pastes through the KDE portal's Clipboard, krdp reads every new selection at once for its RDP client, and xdg-desktop-portal-kde 6.6 then deadlocks. Every later call failed with "AT-SPI application discovery timed out" (screenshot-only `observe` and keyboard `act` too) and the viewer stopped taking input; only replacing the desktop (losing its apps and sign-ins) ended it. While a viewer runs, the routing hook now sends the paste as one keyboard `type` event (upstream's own non-clipboard path), on the direct tools and inside `dispatch`; text over 4,096 characters is refused before anything is sent. Live check: `npm run test:paste-view`.
+
 ### Changed
 
 - `workerMcpExtension()` returns one process-wide factory object (`Symbol.for("pi.orche.worker-mcp-extension")`), shared with pi-codegraph: orche merges capability factories by identity, so a GUI worker that also gets CodeGraph tools loads one MCP extension, not two that would each start the computer-use server.

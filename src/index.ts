@@ -174,7 +174,9 @@ export function createGuiExtension(options: GuiExtensionOptions = {}) {
       if (!registered) return undefined;
       const tool = serverToolOf(event.toolName);
       if (!tool) return undefined;
-      const reason = routeToolCall(tool, event.input as Record<string, unknown>, { allowPhysicalDesktop: loaded.config.allowPhysicalDesktop });
+      const reason = routeToolCall(tool, event.input as Record<string, unknown>, {
+        allowPhysicalDesktop: loaded.config.allowPhysicalDesktop, viewerRunning: () => views.viewing(mainTag), log: line => log.write(line),
+      });
       return reason ? { block: true, reason } : undefined;
     });
     pi.on("tool_result", event => {

@@ -336,6 +336,14 @@ Upstream (computer-use-mcp 0.6.0, see its README, MCP.md and SECURITY.md) and KW
 - Capture uses CPU-readable PipeWire buffers only (no GPU DMA-BUF import); `changed_rect` is advisory; protected-surface
   detection is heuristic.
 - `paste` uses the portal clipboard when granted and does not restore the previous clipboard.
+- **xdg-desktop-portal-kde 6.6 can deadlock on a portal-clipboard paste that another clipboard client reads at once.**
+  krdp does that for a connected RDP client, so an upstream `paste` while `/gui view` runs could stop the private
+  desktop's portal for good: every later call (screenshot-only `observe` and `act` included) fails with "AT-SPI
+  application discovery timed out" (the portal is an accessible app that no longer answers), and the viewer stops taking
+  input. pi-gui therefore types pastes while a viewer runs ([below](#agent-input-while-a-viewer-runs)). A desktop that
+  hung this way did not recover on its own (43 minutes in the reported case); ending the worker (or the session)
+  replaces it, losing its apps and sign-ins. Upstream's development branch has since rewritten the portal's clipboard
+  code (its own data-control source, no blocking `KSystemClipboard` transfer); recheck this when the distribution ships it.
 - A private session has no persistence: windows, app state and the portal grant are gone when its process ends. After a
   crash Pi reconnects on the next call, which starts a fresh private desktop; old IDs are then stale.
 
@@ -347,6 +355,7 @@ npm run typecheck
 npm test            # unit tests + real Pi sessions (faux model) with a fake computer-use-mcp
 npm run test:gui    # live tests on real private desktops (needs the desktop services above)
 npm run test:snap-chromium  # live: the chromium snap on a worker desktop next to the user's running Chromium
+npm run test:paste-view     # live: agent paste while /gui view runs (needs krdp, gcc, wayland-scanner, wayland-protocols)
 ```
 
 `test:gui` drives real Pi sessions with a scripted model through Pi's MCP pipeline into real private desktops:
@@ -459,4 +468,14 @@ Security:
 - The certificate and key live in a 0700 directory inside the private runtime directory and are deleted with the viewer.
 - Whoever connects controls the worker's desktop, with your files and network. Do not share the connection details.
 - While you operate the desktop the worker can still act on it if you give it an assignment; give it none until you stop.
+
+### Agent input while a viewer runs
+
+While a viewer runs on a desktop, the routing hook sends an agent's `act` paste as one keyboard `type` event instead (same
+focus click and text, typed through EIS, as upstream does itself when the portal offers no clipboard), so no portal
+clipboard selection is set for krdp to read (see the xdg-desktop-portal-kde deadlock in
+[Known limitations](#known-limitations)). A paste longer than one `type` event (4,096 characters) is refused before
+anything is sent, with the reason. Other operations, and pastes on desktops without a running viewer, are unchanged.
+`gui.log` notes each converted paste (length only, never the text). The live check is `npm run test:paste-view`: a small
+ext-data-control reader stands in for the RDP client; `PI_GUI_PASTE_VIEW_UNGUARDED=<n>` also shows the upstream hang.
 

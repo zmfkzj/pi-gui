@@ -432,6 +432,65 @@ test("/gui view: a worker's private desktop over loopback RDP, stopped with the 
   assert.match((await command("view W1")).text, /no GUI desktop named "W1"/);
 });
 
+// Regression (live: test/integration/paste-view.integration.ts): an act paste through the KDE portal's Clipboard while krdp
+// serves the same desktop deadlocked xdg-desktop-portal-kde, and every later call failed with "AT-SPI application
+// discovery timed out". While a viewer runs, the routing hook types the paste instead; nothing else changes.
+test("/gui view: while a viewer runs, act paste reaches the server as typing; long text is refused before anything is sent", { skip: !existsSync("/usr/bin/openssl") && "openssl not installed" }, async () => {
+  const bin = await mkdtemp(join(tmpdir(), "pi-gui-krdp-"));
+  const krdp = join(bin, "krdpserver");
+  await writeFile(krdp, `#!/bin/sh\nexport FAKE_KRDP_RECORD=${JSON.stringify(join(bin, "record.json"))}\nexec ${JSON.stringify(process.execPath)} ${JSON.stringify(fakeKrdpScript)} "$@"\n`, { mode: 0o755 });
+  let api: ExtensionAPI | undefined;
+  const cfg = await mkdtemp(join(tmpdir(), "pi-gui-cfg-"));
+  await writeFile(join(cfg, "gui.config.json"), JSON.stringify({ env: { XDG_DATA_DIRS: await workerApps() } }));
+  const main = await startSession([
+    noMcpJson(), pi => { api = pi; },
+    createGuiExtension({ snapChromium: noSnap, agentDir: cfg, resolve: resolveFake, prerequisites: ready, viewer: { prerequisites: () => ({ ok: true, checks: [], missing: [], krdp, openssl: "/usr/bin/openssl" }) } }),
+  ], []);
+  const gui = main.session.extensionRunner.getCommand("gui")!;
+  const notes: { text: string; level?: string }[] = [];
+  const ctx = { hasUI: true, ui: { notify: (text: string, level?: string) => notes.push({ text, level }) } } as unknown as Parameters<typeof gui.handler>[1];
+  const command = async (args: string) => { notes.length = 0; await gui.handler(args, ctx); return notes.at(-1)!; };
+  let provider: CapabilityProvider | undefined;
+  api!.events.emit(CAPABILITY_CHANNEL, { capability: "gui", cwd: process.cwd(), workerId: "W1", role: "implement", readOnly: false, provide: (value: CapabilityProvider) => { provider = value; } });
+  const target = { app_instance_id: "app-0000000000000001", window_instance_id: "win-0000000000000002" };
+  const source = { observation_id: "obs-0000000000000003", frame_id: "frame-0000000000000004" };
+  const paste = (text: string) => ({ target, source_observation: source, operation: { type: "paste", focus: { type: "point", x: 620, y: 63 }, text } });
+  const click = { target, source_observation: source, operation: { type: "pointer", action: { type: "click", x: 1, y: 2 } } };
+  const url = "https://example.test/saved-versions?limit=10\n";
+  const long = "가".repeat(4097);
+  const worker = await startSession(provider!.extensionFactories, [
+    call("mcp__computer_use__list_desktop", { scope: "windows" }),
+    fauxAssistantMessage("desktop up"),
+    call("mcp__computer_use__act", paste(url)),
+    call("mcp__computer_use__act", paste(long)),
+    call("mcp__computer_use__act", click),
+    fauxAssistantMessage("viewer on"),
+    call("mcp__computer_use__act", paste(url)),
+    fauxAssistantMessage("viewer off"),
+  ], { tools: provider!.tools });
+  await worker.session.prompt("start");
+  assert.equal((await command("view W1")).level, "info");
+  await worker.session.prompt("paste with the viewer");
+  const [, typed, refused, clicked] = results(worker.session);
+  assert.equal(typed!.isError, false, typed!.text);
+  const typedArgs = payload(typed!.text);
+  assert.equal(typedArgs.operation, "act");
+  assert.deepEqual(typedArgs.arguments.operation, { type: "keyboard", focus: { type: "point", x: 620, y: 63 }, events: [{ type: "type", text: url }] }, "the paste reached the server as one type event");
+  assert.deepEqual(typedArgs.arguments.target, target);
+  assert.deepEqual(typedArgs.arguments.source_observation, source);
+  assert.equal(refused!.isError, true);
+  assert.doesNotMatch(refused!.text, /^Desktop: /m, "the long paste never reached the server");
+  assert.match(refused!.text, /act paste is refused while \/gui view runs.*4097 characters.*Nothing was sent/s);
+  assert.deepEqual(payload(clicked!.text).arguments.operation, click.operation, "other act operations pass unchanged");
+  assert.match(readFileSync(join(cfg, "gui.log"), "utf8"), /act paste of 45 characters typed instead \(a viewer runs on this desktop\)/);
+
+  assert.match((await command("view stop W1")).text, /Stopped the viewer of W1/);
+  await worker.session.prompt("paste without the viewer");
+  const pasted = results(worker.session).at(-1)!;
+  assert.deepEqual(payload(pasted.text).arguments.operation, paste(url).operation, "without a viewer the paste is upstream's");
+  await shutdown(worker.session);
+});
+
 test("/gui view: missing krdp gives the install command", async () => {
   const missing = () => ({ ok: false, checks: [{ name: "krdpserver (KDE RDP server)", ok: false, detail: "not found", apt: "krdp" }], missing: ["krdpserver (KDE RDP server) (apt: krdp)"] });
   const { session } = await startSession([

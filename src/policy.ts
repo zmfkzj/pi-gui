@@ -19,6 +19,13 @@ export interface PolicyOptions {
    * server, on both tool surfaces. The value is the role name for the refusal text.
    */
   readOnlyRole?: string;
+  /**
+   * Whether a `/gui view` viewer (krdp) runs on this desktop now. While it does, `act` paste is typed instead
+   * ({@link pasteWhileViewing}).
+   */
+  viewerRunning?: () => boolean;
+  /** Notes about calls the policy changed (gui.log). */
+  log?: (line: string) => void;
 }
 
 /** What a read-only worker may do on its private desktop: look, open apps and wait. Nothing that sends input to an app. */
@@ -29,6 +36,32 @@ export function readOnlyRefusal(operation: string, role: string): string {
     + `(${[...OBSERVE_OPERATIONS].join(", ")}). Clicking, typing, form input, submission, upload and sign-in need a worker with `
     + "a writing role: report that the task needs orche_task with role implement and gui: true, delegated explicitly by the main session. "
     + "Public web pages can still be read with browser_fetch.";
+}
+
+/** Longest text of one keyboard `type` event, in Unicode scalar values (upstream's limit). */
+export const TYPE_EVENT_MAX = 4096;
+
+/**
+ * `act` paste while a viewer runs on the desktop. Upstream pastes through the KDE portal's Clipboard (SetSelection,
+ * SelectionTransfer, Ctrl+V). krdp, which serves `/gui view`, reads every new selection at once for its RDP client
+ * (ext-data-control), and xdg-desktop-portal-kde 6.6 deadlocks when its own portal selection is read that way: its main
+ * thread stops for good, so every later call fails with "AT-SPI application discovery timed out" (the portal is an
+ * accessible app) and the viewer stops taking input. The desktop cannot recover without restarting it, which loses its
+ * apps and sign-ins. So the paste is sent as one keyboard `type` event instead: the same focus click and text, typed
+ * through EIS like upstream's own fallback when the portal offers no clipboard, with no selection change. Text longer
+ * than one `type` event is refused before anything is sent. Mutates `args`; returns a reason to block the call.
+ */
+export function pasteWhileViewing(args: Record<string, unknown>, log?: (line: string) => void): string | undefined {
+  const operation = isRecord(args.operation) ? args.operation : undefined;
+  if (operation?.type !== "paste" || typeof operation.text !== "string" || !operation.text) return undefined; // upstream validates the rest
+  const length = [...operation.text].length;
+  if (length > TYPE_EVENT_MAX) {
+    return `act paste is refused while /gui view runs on this desktop: the clipboard paste can freeze the desktop's portal (and with it every GUI call and the viewer), so pastes are typed instead, and this text has ${length} characters, more than one keyboard type event takes (${TYPE_EVENT_MAX}). `
+      + `Nothing was sent. Type it in parts of at most ${TYPE_EVENT_MAX} characters with act keyboard {events: [{type: "type", text}]} (observe between parts), or ask the user to stop the viewer (/gui view stop) first.`;
+  }
+  args.operation = { type: "keyboard", ...(operation.focus !== undefined ? { focus: operation.focus } : {}), events: [{ type: "type", text: operation.text }] };
+  log?.(`act paste of ${length} characters typed instead (a viewer runs on this desktop)`);
+  return undefined;
 }
 
 export const PRIVATE_DESKTOP = "background";
@@ -64,6 +97,8 @@ export function routeOperation(operation: string, args: Record<string, unknown>,
       if (condition?.type === "window_opened" && args.target === undefined) return select();
       return undefined;
     }
+    case "act":
+      return options.viewerRunning?.() ? pasteWhileViewing(args, options.log) : undefined;
     default:
       return undefined;
   }

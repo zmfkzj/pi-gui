@@ -15,6 +15,7 @@
     "test": "node --test 'test/*.test.ts'",
     "test:gui": "node test/integration/gui.integration.ts",
     "test:view": "node test/integration/view.integration.ts",
+    "test:paste-view": "node test/integration/paste-view.integration.ts",
     "test:snap-chromium": "node test/integration/snap-chromium.integration.ts"
   },
   "optionalDependencies": {

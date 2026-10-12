@@ -331,11 +331,14 @@ test("view registry: names, default target, reuse, restart on a replaced desktop
 
   const notYet = await registry.view(w1);
   assert.ok(notYet.kind === "error" && /has not started yet/.test(notYet.message));
+  assert.equal(registry.viewing("t1"), false, "no viewer yet");
   sessions.set("t1", { runtimeDir: runtime("FFFFFF"), display: "wayland-virtual-1", marker: "m", pids: [] });
   const [first, concurrent] = await Promise.all([registry.view(w1), registry.view(w1)]);
   assert.equal(first.kind, "started");
   assert.equal(concurrent.kind, "running", "a second view waits for the first and reuses it");
   assert.deepEqual(started, ["W1"]);
+  assert.equal(registry.viewing("t1"), true, "a started viewer runs");
+  assert.equal(registry.viewing("t2"), false, "other desktops have none");
   const again = await registry.view(w1);
   assert.ok(again.kind === "running" && first.kind === "started" && again.viewer === first.viewer);
   // The worker's server replaced its desktop: the old viewer is stopped and a new one attaches to the new desktop.
@@ -347,6 +350,7 @@ test("view registry: names, default target, reuse, restart on a replaced desktop
   // The worker's session ends: its viewer stops and the name is gone.
   await registry.release("t1");
   assert.deepEqual(stopped, ["W1", "W1"]);
+  assert.equal(registry.viewing("t1"), false, "a released desktop has no viewer");
   assert.deepEqual(registry.list().map(target => target.name), ["main", "W2"]);
   const afterRelease = await registry.view(w1);
   assert.equal(afterRelease.kind, "error");

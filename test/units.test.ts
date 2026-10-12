@@ -8,7 +8,7 @@ import {
   type Backend,
 } from "../src/backend.ts";
 import { DEFAULT_GUI_CONFIG, loadGuiConfig, validateGuiConfig } from "../src/config.ts";
-import { desktopGuidance, routeToolCall, sessionOf } from "../src/policy.ts";
+import { desktopGuidance, routeToolCall, sessionOf, TYPE_EVENT_MAX } from "../src/policy.ts";
 import { checkPrerequisites, doctorStatuses, KWIN_PLUGINS, PORTAL_BACKEND_WRAPPER, RUNNER_PROGRAMS } from "../src/prerequisites.ts";
 
 const config = (patch = {}) => ({ ...DEFAULT_GUI_CONFIG, env: {}, ...patch });
@@ -77,6 +77,39 @@ test("tool names follow Pi's mcp__<server>__<tool> rule", () => {
   assert.equal(toolNames("direct").length, 6);
   assert.equal(serverToolOf("mcp__computer_use__observe"), "observe");
   assert.equal(serverToolOf("mcp__codegraph__codegraph_explore"), undefined);
+});
+
+test("policy: while a viewer runs, act paste is typed instead; too long is refused unchanged; read-only still refused first", () => {
+  const lines: string[] = [];
+  let viewing = true;
+  const options = { allowPhysicalDesktop: false, viewerRunning: () => viewing, log: (line: string) => lines.push(line) };
+  const focus = { type: "point", x: 3, y: 4 };
+  const direct: Record<string, unknown> = { target: { app_instance_id: "app-1", window_instance_id: "win-2" }, operation: { type: "paste", focus, text: "a\nb" } };
+  assert.equal(routeToolCall("act", direct, options), undefined);
+  assert.deepEqual(direct.operation, { type: "keyboard", focus, events: [{ type: "type", text: "a\nb" }] });
+  assert.deepEqual(lines, ["act paste of 3 characters typed instead (a viewer runs on this desktop)"]);
+  const compact = { action: "act", arguments: { operation: { type: "paste", focus, text: "x" } } as Record<string, unknown> };
+  assert.equal(routeToolCall("dispatch", compact, options), undefined);
+  assert.deepEqual(compact.arguments.operation, { type: "keyboard", focus, events: [{ type: "type", text: "x" }] }, "inside dispatch too");
+  // The limit counts Unicode scalar values, like upstream: 4096 astral characters fit, 4097 do not.
+  const fits: Record<string, unknown> = { operation: { type: "paste", focus, text: "\u{1F600}".repeat(TYPE_EVENT_MAX) } };
+  assert.equal(routeToolCall("act", fits, options), undefined);
+  assert.equal((fits.operation as { type: string }).type, "keyboard");
+  const tooLong = { type: "paste", focus, text: "z".repeat(TYPE_EVENT_MAX + 1) };
+  const refusedArgs: Record<string, unknown> = { operation: tooLong };
+  assert.match(routeToolCall("act", refusedArgs, options)!, /act paste is refused while \/gui view runs.*4097 characters.*Nothing was sent.*\/gui view stop/s);
+  assert.equal(refusedArgs.operation, tooLong, "a refused call is left as it was");
+  for (const operation of [{ type: "keyboard", focus, events: [{ type: "press", key: "ctrl+v" }] }, { type: "pointer", action: { type: "click", x: 1, y: 1 } }, { type: "paste", focus, text: "" }]) {
+    const args: Record<string, unknown> = { operation };
+    assert.equal(routeToolCall("act", args, options), undefined);
+    assert.equal(args.operation, operation, `${JSON.stringify(operation)} passes unchanged (upstream validates)`);
+  }
+  viewing = false;
+  const plain: Record<string, unknown> = { operation: { type: "paste", focus, text: "q" } };
+  assert.equal(routeToolCall("act", plain, options), undefined);
+  assert.equal((plain.operation as { type: string }).type, "paste", "no viewer: upstream's paste");
+  viewing = true;
+  assert.match(routeToolCall("act", { operation: { type: "paste", focus, text: "q" } }, { ...options, readOnlyRole: "verify" })!, /read-only/);
 });
 
 test("policy: private desktop by default, foreground refused unless opted in", () => {
