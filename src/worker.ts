@@ -123,7 +123,13 @@ export function workerInstructions(mode: ToolMode, options: { readOnly?: boolean
   ].join("\n");
 }
 
-/** Pi's MCP extension for a worker session: only the servers this session registers, never the user's mcp.json. */
+const SHARED_WORKER_MCP = Symbol.for("pi.orche.worker-mcp-extension");
+/**
+ * Pi's MCP extension for a worker session: only the servers this session registers, never the user's mcp.json. One factory
+ * object per process, shared through `globalThis` with other capability providers (pi-codegraph), so orche, which merges
+ * capability factories by identity, loads one MCP extension per worker session (two would each connect every server).
+ */
 export function workerMcpExtension(): ExtensionFactory {
-  return createMcpExtension({ loadConfig: () => ({ servers: [], errors: [], autoEnableCodemode: false }) });
+  const store = globalThis as { [SHARED_WORKER_MCP]?: ExtensionFactory };
+  return store[SHARED_WORKER_MCP] ??= createMcpExtension({ loadConfig: () => ({ servers: [], errors: [], autoEnableCodemode: false }) });
 }
