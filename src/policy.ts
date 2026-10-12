@@ -11,6 +11,24 @@
 export interface PolicyOptions {
   /** Allow an explicit `desktop: "foreground"` and the foreground-only `human_idle` wait. */
   allowPhysicalDesktop: boolean;
+  /** Worker desktops: a reason to refuse launching this desktop ID (a browser that would open the user's profile; browsers.ts). */
+  checkLaunch?: (desktopId: string) => string | undefined;
+  /**
+   * Worker of a read-only role (orche explore/answer/verify, or no role given): only {@link OBSERVE_OPERATIONS} run.
+   * `act` (clicks, typing, paste, set_value: form input, submission, upload, sign-in) is refused before it reaches the
+   * server, on both tool surfaces. The value is the role name for the refusal text.
+   */
+  readOnlyRole?: string;
+}
+
+/** What a read-only worker may do on its private desktop: look, open apps and wait. Nothing that sends input to an app. */
+export const OBSERVE_OPERATIONS: ReadonlySet<string> = new Set(["list_desktop", "launch_application", "activate_window", "observe", "wait_for"]);
+
+export function readOnlyRefusal(operation: string, role: string): string {
+  return `${operation} is refused: this worker's role (${role}) is read-only, so its private desktop is observe-only `
+    + `(${[...OBSERVE_OPERATIONS].join(", ")}). Clicking, typing, form input, submission, upload and sign-in need a worker with `
+    + "a writing role: report that the task needs orche_task with role implement and gui: true, delegated explicitly by the main session. "
+    + "Public web pages can still be read with browser_fetch.";
 }
 
 export const PRIVATE_DESKTOP = "background";
@@ -24,6 +42,7 @@ const refusal = (what: string) =>
 
 /** Route one operation (`list_desktop`, `act`, ...). Mutates `args`; returns a reason to block the call. */
 export function routeOperation(operation: string, args: Record<string, unknown>, options: PolicyOptions): string | undefined {
+  if (options.readOnlyRole !== undefined && !OBSERVE_OPERATIONS.has(operation)) return readOnlyRefusal(operation, options.readOnlyRole);
   const select = (): string | undefined => {
     const desktop = args.desktop;
     if (desktop === undefined) {
@@ -35,8 +54,9 @@ export function routeOperation(operation: string, args: Record<string, unknown>,
   };
   switch (operation) {
     case "list_desktop":
-    case "launch_application":
       return select();
+    case "launch_application":
+      return select() ?? (options.checkLaunch && typeof args.desktop_id === "string" ? options.checkLaunch(args.desktop_id) : undefined);
     case "wait_for": {
       const condition = isRecord(args.condition) ? args.condition : undefined;
       if (condition?.type === "human_idle") return options.allowPhysicalDesktop ? undefined : refusal("wait_for human_idle (it watches the physical desktop)");
@@ -51,12 +71,15 @@ export function routeOperation(operation: string, args: Record<string, unknown>,
 
 /**
  * Route a call of a server tool: a direct operation, or compact `dispatch {action, arguments}`. `help` and malformed
- * input pass unchanged; upstream validation reports the latter.
+ * input pass unchanged; upstream validation reports the latter. A read-only worker's malformed dispatch is refused
+ * instead (fail closed: its action is not known to be an observation).
  */
 export function routeToolCall(serverTool: string, input: Record<string, unknown>, options: PolicyOptions): string | undefined {
   if (serverTool === "help") return undefined;
   if (serverTool === "dispatch") {
-    if (typeof input.action !== "string" || !isRecord(input.arguments)) return undefined;
+    if (typeof input.action !== "string" || !isRecord(input.arguments)) {
+      return options.readOnlyRole !== undefined ? readOnlyRefusal(`dispatch ${JSON.stringify(input.action ?? null)}`, options.readOnlyRole) : undefined;
+    }
     return routeOperation(input.action, input.arguments, options);
   }
   return routeOperation(serverTool, input, options);

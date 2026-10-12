@@ -70,8 +70,9 @@ changing upstream:
   model sees `mcp__computer_use__help` and `mcp__computer_use__dispatch` (compact mode).
 - **orche workers:** `orche_task { role, request, gui: true }`. pi-gui answers orche's `gui` capability request with the
   extensions for that worker's own session (Pi's MCP extension, limited to this server, plus pi-gui's routing hook), the
-  tool names to allow (the six direct tools) and short instructions. Workers without `gui` get nothing: no MCP extension,
-  no process.
+  tool names to allow (the six direct tools; without `act` for read-only roles) and short instructions. Workers without `gui` get nothing: no MCP extension,
+  no process. This is also the way a worker browses the web interactively (rendered pages, tabs, clicks, forms,
+  sign-in): see [Workers and web browsers](#workers-and-web-browsers).
 - `/gui` or `/gui status`: enabled state, MCP connection, backend, tool mode, desktop policy, private session id, health.
 - `/gui doctor`: the prerequisites with the packages to install, upstream `computer-use-mcp doctor` (host session), and a
   real private-desktop smoke test through upstream's `call` command (starts the private session, lists its windows,
@@ -109,10 +110,154 @@ does not see, and `computer_use_*` (mentioned only when such tools exist) is the
 request. orche workers load neither the physical-desktop extension nor this section; their instructions come with the
 `gui` capability.
 
+## Workers and web browsers
+
+Two boundaries apply to every worker desktop (`src/policy.ts`, `src/browsers.ts`). Both are enforced by the routing hook
+before a call reaches the server, on the direct tools and inside compact `dispatch`.
+
+**Role.** Workers of read-only roles (orche's explore, answer, verify, and any request without role information) get an
+**observe-only** desktop: `list_desktop`, `launch_application`, `activate_window`, `observe`, `wait_for` (and `help`).
+`act` (clicks, typing, paste, `set_value`) is left out of their tool allowlist. It is also refused by the hook if called
+anyway, as is any other or unknown operation and a malformed `dispatch`. The refusal tells the worker to report that the
+task needs `orche_task` with role `implement` and `gui: true`, and that public pages can be read with `browser_fetch`.
+`gui: true` and `allowWorkerUserBrowserProfiles` do not lift this. Writing roles (implement, game-asset, video) get `act`.
+The role is part of the capability key, so a reused worker whose role changes gets a fresh desktop. *Changed:* before
+this, read-only roles had `act` and were only told not to change anything; a verify or answer task that must click
+or type in a GUI app now needs a writing-role worker.
+
+**Browser profiles.** A worker's private desktop has its own XDG config/data/state directories under the runner's
+runtime directory, which the runner deletes when the desktop ends (`rm -rf` in upstream's `run-isolated-session.sh`).
+`$HOME` is the user's, so a browser that keeps its profile under `$HOME` would open the user's own profile, cookies and
+logins. Without the user's `allowWorkerUserBrowserProfiles`, the following applies:
+
+- **Allowed:** Chromium-family browsers installed outside snap/Flatpak (Google Chrome, Debian/Fedora `chromium`, Edge,
+  Brave, Vivaldi) whose launcher does not pin or move a profile. Their default profile is `$XDG_CONFIG_HOME/<name>`,
+  i.e. inside the private desktop's config directory, so they start signed out and the profile goes with the desktop.
+- **Allowed: the installed snap Chromium, only as `pi-gui-chromium-temp-profile.desktop`** (see
+  [snap Chromium with a temporary profile](#snap-chromium-with-a-temporary-profile)): the snap's chrome inside the
+  snap's confinement, with a profile pi-gui creates for each launch and removes afterwards, under a pi-gui supervisor.
+  The snap's own entries (`chromium_chromium.desktop`, its actions, `chromium-browser.desktop`) stay refused, and the
+  refusal points to pi-gui's entry.
+- **Refused, with the reason:**
+  - Browsers that would use the user's profile: snaps (`~/snap/<name>`, including Ubuntu's `/usr/bin/firefox` and
+    `/usr/bin/chromium-browser` wrappers), Flatpaks (`~/.var/app`), Firefox and other browsers with profiles under `$HOME`.
+  - Browser launchers that pin or move the profile (`--user-data-dir`, `--profile`, `-P`, or `HOME` / `XDG_*` /
+    `CHROME_*` / `*PROFILE*` set in `Exec`), and browsers started through D-Bus.
+  - Entries whose `Exec` runs a shell or interpreter command line (`sh -c …`, `python3 -c …`).
+  - Terminals, KRunner, System Settings, `kcmshell`, `kmenuedit`, `xdg-open`, `kde-open`, `kioclient` and `gio`: they
+    start programs by name or change default apps.
+  - Entries without an `Exec` line, and IDs not found in the desktop's application directories (fail closed).
+- **Links:** the worker server gets `XDG_CONFIG_DIRS` / `XDG_DATA_DIRS` entries (under
+  `~/.pi/agent/pi-gui/worker-web/<hash>/`) and `BROWSER`. These make the desktop's default handler for http(s) and HTML
+  the allowed browser (a non-snap one first, else pi-gui's snap Chromium entry, whose program and `$BROWSER` are the
+  same shim to the supervisor), or a no-op entry (`pi-gui-no-browser.desktop`) when there is none, and remove every
+  other browser from those associations. So a link that an app opens through GIO, `xdg-open`/`xdg-mime` or `$BROWSER`
+  does not start the system default (e.g. snap Firefox or the snap's own Chromium entry). The user's own settings are
+  not changed.
+- The worker's instructions name the allowed browser entries, or say that there is none and that one must be installed
+  (on Ubuntu, for example Google Chrome's `.deb`). `/gui status` shows the same (`Worker browsers …`).
+- **Sign-in** stays with the user: the worker leaves the sign-in screen open and reports it; the user signs in through
+  `/gui view` on that worker's desktop and reuses the worker.
+- `allowWorkerUserBrowserProfiles: true` (user config only) lifts the browser, launcher and link checks for workers; their
+  instructions then say that a browser may be signed in as the user. The role boundary stays.
+
+**What this is not.** It is not an OS sandbox. Apps on the private desktop run as the user, with the user's files and
+network. The checks cover the explicit launch path and the desktop's link defaults. They do not cover:
+- a program that an allowed app starts by itself, through its own means (a wrapper script that starts another
+  browser, an app's "open with" dialog, an IDE's built-in terminal);
+- non-browser apps that keep their own profile under `$HOME` (for example a mail client);
+- KDE components that ignore `XDG_CONFIG_DIRS`.
+A worker's bash tool runs on the host regardless. GIO and `xdg-mime` resolution of the pinned defaults is tested
+(`test/browsers.test.ts`), and the private session's processes were seen to inherit them. KIO's resolution was not
+verified on a live desktop; a full snap Chromium run on a worker desktop is (`npm run test:snap-chromium`).
+
+### snap Chromium with a temporary profile
+
+Ubuntu's Chromium is a snap. Started normally it always opens the user's profile: snapd sets
+`CHROME_CONFIG_HOME=$SNAP_USER_COMMON` (`snap.yaml`), and Chromium's default profile is `$CHROME_CONFIG_HOME/chromium`
+(`~/snap/chromium/common/chromium`); while the user's Chromium runs, a second start only hands its URL to the user's
+window. The snap's launcher has `--temp-profile` (`mktemp -d`, passed as `--user-data-dir`), but it is **not used**: when
+`mktemp` fails the launcher passes an empty `--user-data-dir=` and Chromium opens the default profile, the user's; and
+Chromium itself replaces any `--user-data-dir` it cannot create with the default profile
+(`chrome/app/chrome_main_delegate.cc`, `InitializeUserDataDir`). Instead:
+
+- **The default profile itself is moved.** pi-gui runs `snap run --shell chromium -c <script>`: the app's confinement
+  (AppArmor label, mount namespace) and command chain (`gpu-2404-wrapper`, `desktop-launch`), but pi-gui's fixed script
+  (`inSnapScript` in `bin/pi-gui-snap-chromium.mjs`) instead of the launcher. The script checks, inside the confinement,
+  the snap revision pi-gui verified (`$SNAP_REVISION`), and that the launch directory pi-gui created
+  (exactly `/run/user/<uid>/snap.chromium/pi-gui-launch-*` of this uid, every subdirectory a real directory of this
+  user, canonical, the profile directory empty, the profile, home, cache and temporary directories writable: a new file
+  is created with noclobber and removed in each). The environment's shell start-up hooks (`BASH_ENV`, `ENV`,
+  `SHELLOPTS`, exported functions) are removed before the snap runs. Any failure exits with 97 **before Chromium is started**. Then it sets `CHROME_CONFIG_HOME=<launch>/config`,
+  `HOME`, `XDG_CACHE_HOME`, `TMPDIR` and `BREAKPAD_DUMP_LOCATION` into the launch, unsets `CHROME_USER_DATA_DIR` and
+  `CHROMIUM_FLAGS`, and execs the snap's chrome with `--user-data-dir=<launch>/config/chromium`. Chromium's default
+  profile is then that same directory: no fallback of Chromium's leads to the user's profile; if the directory vanished
+  after the check and could not be created again, Chromium has no profile and exits. That `CHROME_CONFIG_HOME` decides
+  the default profile is how the snap itself places the user's profile. The NSS certificate store (`$HOME/.pki`), the disk
+  cache, the singleton socket and temporary files are in the launch as well; the snap's private `/tmp` is not used.
+- **Before anything starts:** the launch directory is created (0700, every subdirectory checked) or the launch is
+  refused, and the user's runtime tmpfs must have 512 MiB and 10,000 inodes free (the cache is limited to 256 MiB).
+- **Offered** (`/gui status`: `Worker browsers …`) when `/usr/bin/snap`, `/snap/bin/chromium` and `systemd-run` exist,
+  the revision `current` points to has the snap's chrome, its command chain is one pi-gui verified (sha256 over the app's
+  `command-chain` list and every script in `snap/command-chain`, `VERIFIED_CHAINS`; a refreshed snap with a changed chain
+  is refused until it is checked again), and no Chromium policy (`/var/snap/chromium/current/policies`,
+  `/etc/chromium-browser/policies`, `/etc/chromium/policies`) sets `UserDataDir` or `DiskCacheDir`; a policy directory that exists but cannot be
+  read is refused too. The chain sources scripts of the content snaps (`gnome-platform`, `gpu-2404`), which refresh on
+  their own and are not pinned; they run before pi-gui's script, which sets the profile last. The launcher, its
+  pre-start profile migration and `~/.chromium-browser.init` do not run at all. Nothing under the user's home is read.
+  The entry's program must be a path without characters that need quoting (xdg-mime skips a quoted one and would fall
+  back to the system default).
+- **Where the desktop runs.** A strict snap reaches neither the private desktop's `/tmp` (it has its own) nor sockets
+  bound outside the paths its AppArmor profile allows (it mediates a socket by the path it was bound at, so a link
+  elsewhere does not help); the snap's runtime dir `/run/user/<uid>/snap.chromium` is allowed. So when the browser is
+  offered, the worker's server gets `TMPDIR=/run/user/<uid>/snap.chromium/pi-gui` and the runner's **whole** private
+  runtime dir is created there: the Wayland, session-bus, AT-SPI and PipeWire sockets, the desktop's
+  `XDG_CONFIG_HOME`/`XDG_DATA_HOME`/`XDG_STATE_HOME`/`KDEHOME`, and the temporary files of the desktop's apps (which inherit
+  that `TMPDIR`, on the size-limited `/run/user` tmpfs). Each browser launch's profile is next to it
+  (`pi-gui-launch-*`). **Trade-off:** the snap's AppArmor profile lets every process confined as
+  `snap.chromium.chromium` read and write there, including the user's own Chromium. A compromised Chromium browser
+  process (a sandbox escape) could therefore read a worker browser's profile or tamper with a worker desktop, e.g. plant
+  an application entry or a `mimeapps.list` in that desktop's own data/config dirs, which come first in its lookup, and so
+  run a program outside the snap's confinement on the worker desktop. Without the snap offered, worker desktops stay in
+  `/tmp` as before.
+- **Launch** (`bin/pi-gui-snap-chromium.mjs`, started by the entry, inside the private desktop): it checks that it runs on
+  such a private desktop (runner marker, 0700 runtime dir of this user inside that directory, sockets inside it), then
+  starts a detached supervisor without the runner's marker and exits. The supervisor runs
+  `systemd-run --user --scope --unit=snap.chromium.chromium-<uuid>.scope -- /usr/bin/snap run --shell chromium -c <script> …`
+  (`snap run` would create that scope over the session bus, which is not the user's here; the scope is created through
+  the user's systemd directly) with: `WAYLAND_DISPLAY` and `AT_SPI_BUS_ADDRESS` as absolute paths of the private
+  desktop's sockets (a relative or missing name would resolve to the snap's link to the physical `wayland-0`), no
+  `DISPLAY`/`XAUTHORITY`, no session bus (Chromium aborts when its bus disconnects; accessibility is turned on with
+  `ACCESSIBILITY_ENABLED=1` and `--force-renderer-accessibility`), no sound or capture devices
+  (`--disable-audio-output`, `--disable-audio-input`, `--use-fake-device-for-media-stream`: the snap's `desktop-launch`
+  sets `PULSE_SERVER` to the user's sound server whatever is given, and its plugs reach cameras), `--password-store=basic`.
+  URLs from links come after `--`; an argument that is not a URL is refused.
+- **Checks while it runs** (defense in depth; the script already decided): the browser must be a process of that scope,
+  run by the verified revision, with exactly `--user-data-dir=<launch>/config/chromium`; otherwise it is killed.
+- **Ownership and cleanup.** The launch's processes are the scope's; its files are its launch directory, with the record
+  `owner.json` (supervisor, browser PID and start time, scope). When the browser closes, when the private desktop ends
+  (the supervisor sees the runner's marker or socket disappear and sends the browser TERM), or when the supervisor gets
+  TERM/INT/HUP, the browser stops gracefully, then the rest of the scope (KILL after 10 s), and the launch directory is
+  removed (directories inside are made accessible first; links are removed, not followed). If the supervisor is killed
+  too, the directory stays and the next launch removes it once its supervisor and scope are gone (only
+  `pi-gui-launch-*` directories of this user).
+- **Shared with the user's Chromium, by the snap's design** (not tabs, cookies, logins or other profile content): the
+  snap's per-user files that the command chain's `desktop-launch` maintains on every start of the app
+  (`~/snap/chromium/<rev>/.config` GTK, fontconfig, `dconf` and `mimeapps` links, `~/snap/chromium/common/.cache` font and
+  icon caches), the snap's runtime dir, AppArmor label and mount namespace, and a systemd scope in the user's manager.
+  The snap's `daemon` (kiosk) setting is not used (the launcher does not run).
+- **Not covered:** a SIGKILL of the supervisor and its whole scope with no later launch leaves that launch's directory
+  (the worker's own session data) in `/run/user/<uid>/snap.chromium` until the next launch or logout. Removable media
+  are reachable through the snap's plugs, as for any app on the desktop. A process of the same user that already
+  reaches the user's profile (including the user's own snap Chromium, which shares the AppArmor label over
+  `/run/user/<uid>/snap.chromium`) could replace the launch's `config` with a link after the in-snap check and before
+  Chromium starts; that is deliberate tampering by something with that access already, not a fallback of pi-gui's.
+  KIO's link handling was not checked on a live desktop.
+
 ## Configuration
 
 `~/.pi/agent/gui.config.json`, optionally overridden key by key by a trusted project's `.pi/gui.config.json` (which may not
-set `allowPhysicalDesktop`, `command`, `args` or `env`). Unknown keys or wrong types reject the whole file with a warning.
+set `allowPhysicalDesktop`, `allowWorkerUserBrowserProfiles`, `command`, `args` or `env`). Unknown keys or wrong types reject the whole file with a warning.
 
 ```json
 {
@@ -124,6 +269,7 @@ set `allowPhysicalDesktop`, `command`, `args` or `env`). Unknown keys or wrong t
   "workerMode": "direct",
   "exposure": "direct",
   "allowPhysicalDesktop": false,
+  "allowWorkerUserBrowserProfiles": false,
   "timeoutSeconds": 150,
   "env": {}
 }
@@ -139,6 +285,7 @@ set `allowPhysicalDesktop`, `command`, `args` or `env`). Unknown keys or wrong t
 | `workerMode` | `"direct"` | Tool surface of GUI workers, which are spawned for GUI work. |
 | `exposure` | `"direct"` | Pi exposure in the main session (`direct`, `deferred`, `codemode`). Workers always use `direct`. |
 | `allowPhysicalDesktop` | `false` | See above. |
+| `allowWorkerUserBrowserProfiles` | `false` | Workers may also launch browsers that use the user's own profile. See [Workers and web browsers](#workers-and-web-browsers). |
 | `timeoutSeconds` | `150` | Pi's MCP request timeout. The first call of a session starts the private desktop (upstream allows 120 s). |
 | `env` | `{}` | Extra server environment (e.g. `RUST_LOG`). Physical-session variables are still removed. |
 
@@ -183,7 +330,8 @@ Upstream (computer-use-mcp 0.6.0, see its README, MCP.md and SECURITY.md) and KW
   Qt/KDE apps and GTK 3 apps work (the live tests use a small GTK 3 editor).
 - Isolation is routing and process separation for cooperative same-user processes, **not a sandbox**: apps on a private
   desktop run as the user, with the user's files and network. Private desktops get private XDG config/data/state
-  directories, but `$HOME` is shared (for example a browser profile under `~/.mozilla`).
+  directories, but `$HOME` is shared (for example a browser profile under `~/.mozilla`); worker desktops therefore open
+  only browsers with a disposable profile ([Workers and web browsers](#workers-and-web-browsers)).
 - AT-SPI reads and semantic actions need no portal approval; a screenshot contains the whole (private) monitor.
 - Capture uses CPU-readable PipeWire buffers only (no GPU DMA-BUF import); `changed_rect` is advisory; protected-surface
   detection is heuristic.
@@ -198,6 +346,7 @@ npm install --legacy-peer-deps
 npm run typecheck
 npm test            # unit tests + real Pi sessions (faux model) with a fake computer-use-mcp
 npm run test:gui    # live tests on real private desktops (needs the desktop services above)
+npm run test:snap-chromium  # live: the chromium snap on a worker desktop next to the user's running Chromium
 ```
 
 `test:gui` drives real Pi sessions with a scripted model through Pi's MCP pipeline into real private desktops:
@@ -209,6 +358,18 @@ npm run test:gui    # live tests on real private desktops (needs the desktop ser
 - C: ending one agent's session removes its server and desktop, and the other keeps working.
 - D: a new session gets a new desktop.
 - Cleanup: nothing outlives its session.
+
+`test:snap-chromium` (outputs and screenshots in `$PI_GUI_LIVE_OUT`, default `./.pi-gui-live`) runs one worker (role
+implement) through the real capability: S1 launches `pi-gui-chromium-temp-profile.desktop` (the snap's own entry is
+refused), opens https://example.com and follows its link, and checks that the browser's only `--user-data-dir` is the
+profile pi-gui created for the launch (and its singleton socket is in the launch too), that no process of its scope is
+connected to the physical session's Wayland, buses, PipeWire/PulseAudio or X11 or holds a file of
+`~/snap/chromium/common/chromium`, that crash databases are the launch's own, and that the user's Chromium keeps its
+PID, start time and profile lock. S2 closes the window (Ctrl+Shift+W); S4 SIGKILLs the supervisor and the scope, and the
+next launch removes the left launch directory; S3 ends the worker session (the desktop). After each: no process of the
+scope and no launch directory left. The fail-closed start (no browser start at all when the launch's profile cannot be
+created or kept, never the user's profile) is covered by `test/snap-chromium.test.ts`, including the script inside the
+real snap's confinement.
 
 Screenshots go to `$TMPDIR/pi-gui-live/`.
 

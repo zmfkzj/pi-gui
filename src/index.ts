@@ -1,17 +1,21 @@
+import { join } from "node:path";
 import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
   resolveBackend, SERVER_NAME, serverConfig, serverToolOf, toolNames, UPSTREAM_VERSION,
   type Backend, type BackendResolution,
 } from "./backend.ts";
-import { DEFAULT_GUI_CONFIG, loadGuiConfig, type LoadedGuiConfig } from "./config.ts";
+import { DEFAULT_GUI_CONFIG, loadGuiConfig, type GuiConfig, type LoadedGuiConfig } from "./config.ts";
 import { GuiLog } from "./log.ts";
-import { desktopGuidance, GUIDANCE_SECTION, routeToolCall, sessionOf } from "./policy.ts";
+import { desktopGuidance, GUIDANCE_SECTION, OBSERVE_OPERATIONS, routeToolCall, sessionOf } from "./policy.ts";
 import {
   backendVersion, checkPrerequisites, doctorStatuses, privateDesktopSmoke, upstreamDoctor, type PrerequisiteReport,
 } from "./prerequisites.ts";
 import {
   CAPABILITY_CHANNEL, GUI_CAPABILITY, guiSessionExtension, isCapabilityRequest, workerInstructions, workerMcpExtension,
 } from "./worker.ts";
+import {
+  browserEnv, checkWorkerLaunch, listBrowsers, SNAP_CHROMIUM_ID, SNAP_CHROMIUM_SUPERVISOR, snapChromiumShimFits, snapChromiumStatus, snapDesktopsDir, webDefaultsEnv,
+} from "./browsers.ts";
 import {
   checkViewerPrerequisites, connectionMessage, findPrivateSession, newViewTag, probeRdpClients, startViewer, VIEW_HOST, ViewRegistry, withViewTag,
   type PrivateSession, type RunningViewer, type SessionLookup,
@@ -31,6 +35,8 @@ export interface GuiExtensionOptions {
   agentDir?: string;
   /** Test seams. */
   resolve?: typeof resolveBackend;
+  /** Whether snap Chromium with a temporary profile can be offered to workers (default: the real check). */
+  snapChromium?: () => ReturnType<typeof snapChromiumStatus>;
   prerequisites?: typeof checkPrerequisites;
   viewer?: {
     find?: (tag: string) => SessionLookup;
@@ -51,6 +57,12 @@ export function createGuiExtension(options: GuiExtensionOptions = {}) {
   return function gui(pi: ExtensionAPI): void {
     const agentDir = options.agentDir ?? getAgentDir();
     const log = new GuiLog(agentDir, "main");
+    const webRoot = join(agentDir, "pi-gui", "worker-web");
+    /** snap Chromium for workers: the machine check, and a shim path that xdg-mime accepts (browsers.ts PLAIN_EXEC_PATH). */
+    const snapStatus = (): ReturnType<typeof snapChromiumStatus> => {
+      const status = (options.snapChromium ?? (() => snapChromiumStatus(process.getuid?.() ?? -1)))();
+      return status.ok && !snapChromiumShimFits(webRoot) ? { ok: false, reason: `the path ${webRoot} needs quoting in a desktop entry` } : status;
+    };
     let loaded: LoadedGuiConfig = { config: { ...DEFAULT_GUI_CONFIG, env: {} }, sources: [], errors: [] };
     let resolution: BackendResolution | undefined;
     let prerequisites: PrerequisiteReport | undefined;
@@ -199,25 +211,69 @@ export function createGuiExtension(options: GuiExtensionOptions = {}) {
       if (!prerequisites?.ok) return data.provide({ error: `GUI unavailable: missing ${prerequisites?.missing.join(", ")}; run /gui doctor` });
       const found = workerResolution.backend;
       const names = toolNames(config.workerMode);
-      const server = serverConfig(found, config, { physical: false, exposure: "direct", runnerEnv: prerequisites.overrides });
+      const baseServer = serverConfig(found, config, { physical: false, exposure: "direct", runnerEnv: prerequisites.overrides });
       // A fresh tag per answer: it marks this worker's server (and its private desktop) for /gui view. It is not part
       // of the key, so a reused worker keeps its session; factories load only into a newly spawned one.
       const tag = newViewTag();
+      // Read-only unless orche says the role writes (a request without role information is read-only): observe-only
+      // desktop, enforced by the routing hook and the tool allowlist. Browsers only with a disposable profile, programs
+      // that start other programs refused, and links pinned to a disposable browser, unless the user opted in.
+      const readOnly = data.readOnly !== false;
+      const role = typeof data.role === "string" && data.role ? data.role : "unspecified";
+      const userProfiles = config.allowWorkerUserBrowserProfiles;
+      const appEnv = { ...process.env, ...config.env };
+      const apps = browserEnv(appEnv);
+      const browsers = listBrowsers(apps);
+      // The installed snap Chromium only through pi-gui's entry: temporary profile, supervised (browsers.ts).
+      const snap = userProfiles ? undefined : snapStatus();
+      const snapChromium = snap?.ok === true;
+      const web = {
+        browsers: [...browsers.filter(verdict => userProfiles || verdict.disposable).map(verdict => verdict.entry.id), ...(snapChromium ? [SNAP_CHROMIUM_ID] : [])],
+        userProfiles,
+      };
+      const checkLaunch = userProfiles ? undefined : (desktopId: string) => checkWorkerLaunch(desktopId, apps, { snapChromium });
+      let server = baseServer;
+      if (!userProfiles) {
+        try {
+          const snapLaunch = snapChromium ? { node: process.execPath, supervisor: SNAP_CHROMIUM_SUPERVISOR, log: join(agentDir, "gui-snap-chromium.log") } : undefined;
+          // The snap may connect only to sockets bound under /run/user/<uid>/snap.chromium, so the runner's private
+          // runtime dir (mktemp in TMPDIR) goes there.
+          const desktops = snapChromium && snap?.ok ? snapDesktopsDir(snap.userRuntime) : undefined;
+          server = {
+            ...baseServer,
+            env: { ...baseServer.env, ...webDefaultsEnv(webRoot, browsers, appEnv, snapLaunch), ...(desktops ? { TMPDIR: desktops } : {}) },
+          };
+        } catch (error) {
+          return data.provide({ error: `GUI unavailable: cannot write the worker desktop's web defaults (${error instanceof Error ? error.message : String(error)})` });
+        }
+      }
+      const workerTools = readOnly ? names.filter(name => OBSERVE_OPERATIONS.has(serverToolOf(name) ?? "") || serverToolOf(name) === "help" || serverToolOf(name) === "dispatch") : names;
       data.provide({
-        key: JSON.stringify({ server, mode: config.workerMode }),
-        tools: names,
+        key: JSON.stringify({ server, mode: config.workerMode, readOnly, userProfiles }),
+        tools: workerTools,
         extensionFactories: [
           workerMcpExtension(),
           guiSessionExtension({
-            server: withViewTag(server, tag), policy: { allowPhysicalDesktop: false }, log: new GuiLog(agentDir, `worker:${data.workerId ?? "?"}`),
+            server: withViewTag(server, tag), policy: { allowPhysicalDesktop: false, ...(checkLaunch ? { checkLaunch } : {}), ...(readOnly ? { readOnlyRole: role } : {}) }, log: new GuiLog(agentDir, `worker:${data.workerId ?? "?"}`),
             label: `${found.label}, ${config.workerMode}`, view: { registry: views, name: data.workerId ?? "worker", tag },
           }),
         ],
-        instructions: workerInstructions(config.workerMode),
-        toolTimeoutsMs: Object.fromEntries(names.map(name => [name, config.timeoutSeconds * 1000])),
+        instructions: workerInstructions(config.workerMode, { readOnly, web }),
+        toolTimeoutsMs: Object.fromEntries(workerTools.map(name => [name, config.timeoutSeconds * 1000])),
       });
     });
 
+    /** Which browsers a worker may open on its desktop (disposable profile), and which it may not and why. */
+    const workerBrowsersLine = (config: GuiConfig): string => {
+      const appEnv = { ...process.env, ...config.env };
+      const verdicts = listBrowsers(browserEnv(appEnv));
+      if (config.allowWorkerUserBrowserProfiles) return `Worker browsers: any (allowWorkerUserBrowserProfiles: the user's own profiles allowed): ${verdicts.map(verdict => verdict.entry.id).join(", ") || "none found"}`;
+      const snap = snapStatus();
+      const usable = [...verdicts.filter(verdict => verdict.disposable).map(verdict => verdict.entry.id), ...(snap.ok ? [`${SNAP_CHROMIUM_ID} (snap Chromium, temporary profile)`] : [])];
+      const refused = verdicts.flatMap(verdict => verdict.disposable ? [] : [`${verdict.entry.id} (${verdict.reason})`]);
+      const snapLine = snap.ok ? "" : `; snap Chromium with a temporary profile not offered: ${snap.reason}`;
+      return `Worker browsers (disposable profile): ${usable.join(", ") || "none — install a Chromium-family browser outside snap/Flatpak, e.g. Google Chrome"}${snapLine}${refused.length ? `; refused: ${refused.join("; ")}` : ""}`;
+    };
     const statusReport = (): string => {
       const { config } = loaded;
       const found = backend();
@@ -231,6 +287,7 @@ export function createGuiExtension(options: GuiExtensionOptions = {}) {
         `Private session: ${lastSession ? `${lastSession.desktop} ${lastSession.session}` : "not started (starts on the first call)"}`,
         `Health: ${state === "ready" || state === "starting" ? (lastError ? `error: ${lastError}` : state === "ready" ? "ok" : "starting") : state === "unavailable" || state === "error" ? `${state}: ${lastError ?? "see /gui doctor"}` : state}`,
         `Workers: ${config.enabled && found && prerequisites?.ok ? "orche_task gui:true gets a private desktop per worker" : "GUI capability unavailable"}`,
+        workerBrowsersLine(config),
         `Viewers (/gui view): ${views.describe()}`,
         `Config: ${loaded.sources.length ? loaded.sources.join(", ") : "defaults"}${loaded.errors.length ? ` (ignored: ${loaded.errors.join("; ")})` : ""}`,
         `Log: ${log.path}`,

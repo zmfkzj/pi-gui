@@ -1,8 +1,8 @@
 // Real Pi sessions (SDK, faux model) with Pi's own MCP extension and a fake computer-use-mcp: the routing hook, the
 // server environment, the worker capability and the process lifecycle go through Pi's actual pipeline.
 import assert from "node:assert/strict";
-import { existsSync, readFileSync } from "node:fs";
-import { mkdtemp, writeFile } from "node:fs/promises";
+import { existsSync, readFileSync, statSync } from "node:fs";
+import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
@@ -14,7 +14,7 @@ import {
   type AgentSession, type ExtensionAPI, type ExtensionFactory,
 } from "@earendil-works/pi-coding-agent";
 import { NO_RUNTIME_DIR, type Backend } from "../src/backend.ts";
-import { createGuiExtension } from "../src/index.ts";
+import { createGuiExtension, type GuiExtensionOptions } from "../src/index.ts";
 import { checkPrerequisites } from "../src/prerequisites.ts";
 import { CAPABILITY_CHANNEL, type CapabilityProvider } from "../src/worker.ts";
 
@@ -68,7 +68,7 @@ test("main session: private desktop by default, sanitized server environment, fo
   process.env.WAYLAND_DISPLAY ??= "wayland-test";
   const { session, agentDir } = await startSession([
     noMcpJson(),
-    createGuiExtension({ agentDir: await mkdtemp(join(tmpdir(), "pi-gui-cfg-")), resolve: resolveFake, prerequisites: ready }),
+    createGuiExtension({ snapChromium: noSnap, agentDir: await mkdtemp(join(tmpdir(), "pi-gui-cfg-")), resolve: resolveFake, prerequisites: ready }),
   ], [
     call("mcp__computer_use__dispatch", { action: "list_desktop", arguments: { scope: "windows" } }),
     call("mcp__computer_use__dispatch", { action: "list_desktop", arguments: { scope: "windows", desktop: "foreground" } }),
@@ -102,7 +102,7 @@ test("main session: the system prompt says which screen each computer-use tool r
   });
   const prompt = async (factories: ExtensionFactory[], prerequisites = ready) => {
     const { session } = await startSession([noMcpJson(), ...factories,
-      createGuiExtension({ agentDir: await mkdtemp(join(tmpdir(), "pi-gui-cfg-")), resolve: resolveFake, prerequisites })], [fauxAssistantMessage("ok")]);
+      createGuiExtension({ snapChromium: noSnap, agentDir: await mkdtemp(join(tmpdir(), "pi-gui-cfg-")), resolve: resolveFake, prerequisites })], [fauxAssistantMessage("ok")]);
     await session.prompt("hello");
     return JSON.stringify(session.messages) + session.systemPrompt;
   };
@@ -119,13 +119,15 @@ test("main session: the system prompt says which screen each computer-use tool r
 test("worker capability: one server process per worker session, stopped with its session", async () => {
   let api: ExtensionAPI | undefined;
   const capture: ExtensionFactory = pi => { api = pi; };
+  const cfg = await mkdtemp(join(tmpdir(), "pi-gui-cfg-"));
+  await writeFile(join(cfg, "gui.config.json"), JSON.stringify({ env: { XDG_DATA_DIRS: await workerApps() } }));
   await startSession([
     noMcpJson(), capture,
-    createGuiExtension({ agentDir: await mkdtemp(join(tmpdir(), "pi-gui-cfg-")), resolve: resolveFake, prerequisites: ready }),
+    createGuiExtension({ snapChromium: noSnap, agentDir: cfg, resolve: resolveFake, prerequisites: ready }),
   ], []);
   const request = (capability: string, workerId: string) => {
     let answer: CapabilityProvider | { error: string } | undefined;
-    api!.events.emit(CAPABILITY_CHANNEL, { capability, cwd: process.cwd(), workerId, provide: (value: CapabilityProvider | { error: string }) => { answer = value; } });
+    api!.events.emit(CAPABILITY_CHANNEL, { capability, cwd: process.cwd(), workerId, role: "implement", readOnly: false, provide: (value: CapabilityProvider | { error: string }) => { answer = value; } });
     return answer;
   };
   assert.equal(request("telepathy", "W0"), undefined, "other capabilities are not answered");
@@ -165,12 +167,196 @@ test("worker capability is refused with the reason when prerequisites are missin
   let api: ExtensionAPI | undefined;
   await startSession([
     noMcpJson(), pi => { api = pi; },
-    createGuiExtension({ agentDir: await mkdtemp(join(tmpdir(), "pi-gui-cfg-")), resolve: resolveFake,
+    createGuiExtension({ snapChromium: noSnap, agentDir: await mkdtemp(join(tmpdir(), "pi-gui-cfg-")), resolve: resolveFake,
       prerequisites: () => ({ ok: false, checks: [], missing: ["kwin_wayland (apt: kwin-wayland)"], overrides: {}, host: "test" }) }),
   ], []);
   let answer: unknown;
   api!.events.emit(CAPABILITY_CHANNEL, { capability: "gui", cwd: process.cwd(), provide: (value: unknown) => { answer = value; } });
   assert.match((answer as { error: string }).error, /missing kwin_wayland/);
+});
+
+/**
+ * A data dir of apps for worker tests: a disposable-profile browser (Chromium family, not a snap), Firefox (profile under
+ * $HOME), a terminal, an `sh -c` wrapper, a Chromium launcher that moves its profile through the environment, and KWrite.
+ */
+/** Hosts without a usable snap Chromium (the default here: tests do not depend on this machine's snaps). */
+const noSnap = () => ({ ok: false as const, reason: "the chromium snap is not installed (test)" });
+
+async function workerApps(extra: Record<string, string> = {}) {
+  const root = await mkdtemp(join(tmpdir(), "pi-gui-apps-"));
+  const apps = join(root, "share", "applications");
+  await mkdir(apps, { recursive: true });
+  await mkdir(join(root, "bin"), { recursive: true });
+  const http = "MimeType=text/html;x-scheme-handler/http;x-scheme-handler/https;";
+  const entries: Record<string, string> = {
+    "google-chrome": `Exec=${join(root, "bin", "google-chrome")} %U\n${http}`,
+    firefox: `Exec=${join(root, "bin", "firefox")} %u\n${http}`,
+    "chromium-home": `Exec=env XDG_CONFIG_HOME=/home/someone/.config ${join(root, "bin", "chromium")} %U\n${http}`,
+    "org.kde.konsole": `Exec=${join(root, "bin", "konsole")}\nCategories=Qt;KDE;System;TerminalEmulator;`,
+    "open-link": "Exec=sh -c 'firefox https://example.com'\nCategories=Network;",
+    "org.kde.kwrite": `Exec=${join(root, "bin", "kwrite")} %U\nMimeType=text/plain;`,
+    ...extra,
+  };
+  for (const name of ["google-chrome", "firefox", "chromium", "konsole", "kwrite"]) await writeFile(join(root, "bin", name), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+  for (const [id, body] of Object.entries(entries)) await writeFile(join(apps, `${id}.desktop`), `[Desktop Entry]\nType=Application\nName=${id}\n${body}\n`);
+  return join(root, "share");
+}
+
+/** A main session with pi-gui (fake backend) and a function that asks it for a worker's GUI capability. */
+async function guiProvider(config: Record<string, unknown> = {}, options: { snapChromium?: GuiExtensionOptions["snapChromium"]; apps?: Record<string, string> } = {}) {
+  const agentDir = await mkdtemp(join(tmpdir(), "pi-gui-cfg-"));
+  await writeFile(join(agentDir, "gui.config.json"), JSON.stringify({ env: { XDG_DATA_DIRS: await workerApps(options.apps) }, ...config }));
+  let api: ExtensionAPI | undefined;
+  await startSession([noMcpJson(), pi => { api = pi; }, createGuiExtension({ snapChromium: options.snapChromium ?? noSnap, agentDir, resolve: resolveFake, prerequisites: ready })], []);
+  const request = (fields: Record<string, unknown>) => {
+    let answer: CapabilityProvider | undefined;
+    api!.events.emit(CAPABILITY_CHANNEL, { capability: "gui", cwd: process.cwd(), workerId: "W1", ...fields, provide: (value: CapabilityProvider) => { answer = value; } });
+    return answer!;
+  };
+  return { agentDir, request };
+}
+
+/** Run tool calls in a worker session loaded from `provider`; `extraTools` simulates a widened allowlist. */
+async function runWorker(provider: CapabilityProvider, calls: [string, Record<string, unknown>][], extraTools: string[] = []) {
+  const worker = await startSession(provider.extensionFactories, [...calls.map(([name, args]) => call(name, args as Parameters<typeof call>[1])), fauxAssistantMessage("done")], { tools: ["read", ...provider.tools, ...extraTools] });
+  await worker.session.prompt("work");
+  const found = results(worker.session);
+  await shutdown(worker.session);
+  return found;
+}
+const tool = (name: string) => `mcp__computer_use__${name}`;
+/** A result from the (fake) server, not a refusal of the routing hook. */
+const reachedServer = (result: { text: string }) => /^Desktop: \w+ session=/.test(result.text);
+const act = { target: { app_instance_id: "app-1", window_instance_id: "win-1" }, source_observation: { observation_id: "obs-1" }, operation: { type: "semantic", action: { type: "invoke" } } };
+
+test("worker capability: read-only roles get an observe-only desktop, enforced before the server (direct tools)", async () => {
+  const { request } = await guiProvider();
+  for (const fields of [{ role: "answer", readOnly: true }, { role: "explore", readOnly: true }, { role: "verify", readOnly: true }, {}]) {
+    const answer = request(fields);
+    assert.deepEqual(answer.tools, ["list_desktop", "launch_application", "activate_window", "observe", "wait_for"].map(tool), JSON.stringify(fields));
+    assert.match(answer.instructions, /Your role is read-only, so this desktop is observe-only/);
+    assert.doesNotMatch(answer.instructions, /→ act/);
+  }
+  const implement = request({ role: "implement", readOnly: false });
+  assert.ok(implement.tools.includes(tool("act")));
+  assert.doesNotMatch(implement.instructions, /read-only/);
+  assert.notEqual(implement.key, request({ role: "answer", readOnly: true }).key, "a role change replaces the worker");
+
+  // Even with act in the session's allowlist, the routing hook refuses it before it reaches the server.
+  const [refused, observed] = await runWorker(request({ role: "answer", readOnly: true }), [[tool("act"), { ...act }], [tool("observe"), { target: act.target }]], [tool("act")]);
+  assert.equal(refused!.isError, true);
+  assert.equal(reachedServer(refused!), false);
+  assert.match(refused!.text, /act is refused: this worker's role \(answer\) is read-only.*orche_task with role implement and gui: true.*browser_fetch/s);
+  assert.equal(reachedServer(observed!), true, observed!.text);
+  const [missingRole] = await runWorker(request({}), [[tool("act"), { ...act }]], [tool("act")]);
+  assert.match(missingRole!.text, /role \(unspecified\) is read-only/);
+  const [allowed] = await runWorker(implement, [[tool("act"), { ...act }]]);
+  assert.equal(reachedServer(allowed!), true, allowed!.text);
+
+  // The user's browser-profile opt-in does not lift the role boundary.
+  const optedIn = (await guiProvider({ allowWorkerUserBrowserProfiles: true })).request({ role: "verify", readOnly: true });
+  assert.ok(!optedIn.tools.includes(tool("act")));
+  const [stillRefused] = await runWorker(optedIn, [[tool("act"), { ...act }]], [tool("act")]);
+  assert.equal(reachedServer(stillRefused!), false);
+});
+
+test("worker capability: compact dispatch has the same boundary, failing closed on malformed input", async () => {
+  const { request } = await guiProvider({ workerMode: "compact" });
+  const answer = request({ role: "answer", readOnly: true });
+  assert.deepEqual(answer.tools, [tool("help"), tool("dispatch")]);
+  const found = await runWorker(answer, [
+    [tool("dispatch"), { action: "act", arguments: { ...act } }],
+    [tool("dispatch"), { action: "act" }],
+    [tool("dispatch"), { action: "launch_application", arguments: { desktop_id: "firefox.desktop" } }],
+    [tool("dispatch"), { action: "launch_application", arguments: { desktop_id: "google-chrome.desktop" } }],
+  ]);
+  assert.deepEqual(found.map(reachedServer), [false, false, false, true], found.map(result => result.text).join("\n"));
+  assert.match(found[0]!.text, /act is refused: this worker's role \(answer\) is read-only/);
+  assert.match(found[1]!.text, /dispatch "act" is refused/);
+  assert.match(found[2]!.text, /firefox\.desktop is refused/);
+  const [written] = await runWorker(request({ role: "implement", readOnly: false }), [[tool("dispatch"), { action: "act", arguments: { ...act } }]]);
+  assert.equal(reachedServer(written!), true, written!.text);
+});
+
+test("worker capability: launches that would reach the user's browser profile are refused; links go to the allowed browser", async () => {
+  const { agentDir, request } = await guiProvider();
+  const provider = request({ role: "implement", readOnly: false });
+  assert.match(provider.instructions, /Web browsers: launch only google-chrome\.desktop\. It starts signed out with a fresh or temporary profile of its own \(not the user's\)/);
+  const launch = (id: string): [string, Record<string, unknown>] => [tool("launch_application"), { desktop_id: id }];
+  const found = await runWorker(provider, ["google-chrome.desktop", "firefox.desktop", "chromium-home.desktop", "org.kde.konsole.desktop", "open-link.desktop", "missing.desktop", "org.kde.kwrite.desktop"].map(launch));
+  assert.deepEqual(found.map(reachedServer), [true, false, false, false, false, false, true], found.map(result => result.text).join("\n"));
+  assert.match(found[1]!.text, /firefox\.desktop is refused.*only Chromium-family browsers/);
+  assert.match(found[2]!.text, /sets environment variables that can move the profile/);
+  assert.match(found[3]!.text, /it is a terminal/);
+  assert.match(found[4]!.text, /runs a command line through sh/);
+  assert.match(found[5]!.text, /no such application entry was found/);
+  // The server (and so the private desktop and its apps) gets the pinned web defaults.
+  const seen = payload(found[0]!.text);
+  assert.match(seen.env.BROWSER!, /\/bin\/google-chrome$/);
+  const configDir = seen.env.XDG_CONFIG_DIRS!.split(":")[0]!;
+  assert.ok(configDir.startsWith(join(agentDir, "pi-gui", "worker-web")), configDir);
+  const mimeapps = readFileSync(join(configDir, "mimeapps.list"), "utf8");
+  assert.match(mimeapps, /\[Default Applications\]\nx-scheme-handler\/http=google-chrome\.desktop;/);
+  assert.match(mimeapps, /\[Removed Associations\][^[]*x-scheme-handler\/https=chromium-home\.desktop;firefox\.desktop;/);
+
+  // The user's opt-in lifts the browser check and the pinned defaults, nothing else.
+  const optedIn = (await guiProvider({ allowWorkerUserBrowserProfiles: true })).request({ role: "implement", readOnly: false });
+  assert.match(optedIn.instructions, /The user allowed browsers that use their own profile here/);
+  const [firefox] = await runWorker(optedIn, [launch("firefox.desktop")]);
+  assert.equal(reachedServer(firefox!), true);
+  assert.equal(payload(firefox!.text).env.BROWSER, process.env.BROWSER ?? null);
+});
+
+test("worker capability: the installed snap Chromium runs only through pi-gui's temporary-profile entry", async () => {
+  const userRuntime = await mkdtemp(join(tmpdir(), "pgr-"));
+  const snapApps = {
+    chromium_chromium: "Exec=/snap/bin/chromium %U\nX-SnapInstanceName=chromium\nCategories=Network;WebBrowser;\nMimeType=text/html;x-scheme-handler/http;x-scheme-handler/https;",
+  };
+  // No non-snap browser: pi-gui's entry is the only browser and the links' handler.
+  const apps = { ...snapApps, "google-chrome": "Exec=/nonexistent/google-chrome %U\nMimeType=text/html;x-scheme-handler/http;" };
+  const { agentDir, request } = await guiProvider({}, { apps, snapChromium: () => ({ ok: true, userRuntime }) });
+  const provider = request({ role: "implement", readOnly: false });
+  assert.match(provider.instructions, /Web browsers: launch only pi-gui-chromium-temp-profile\.desktop\./);
+  const launch = (id: string): [string, Record<string, unknown>] => [tool("launch_application"), { desktop_id: id }];
+  const found = await runWorker(provider, ["pi-gui-chromium-temp-profile.desktop", "pi-gui-chromium-temp-profile", "chromium_chromium.desktop", "firefox.desktop"].map(launch));
+  assert.deepEqual(found.map(reachedServer), [true, true, false, false], found.map(result => result.text).join("\n"));
+  assert.match(found[2]!.text, /chromium_chromium\.desktop is refused.*is a snap.*launch pi-gui-chromium-temp-profile\.desktop: the same snap Chromium with a temporary profile/s);
+  const env = payload(found[0]!.text).env;
+  // The private desktop's runtime dir lands in /run/user/<uid>/snap.chromium (here: a stand-in), where the snap may connect.
+  assert.equal(env.TMPDIR, join(userRuntime, "snap.chromium", "pi-gui"));
+  assert.equal(statSync(env.TMPDIR!).mode & 0o777, 0o700);
+  // Default launch, registered entry, links and $BROWSER all go through the same shim → supervisor.
+  const dataDir = env.XDG_DATA_DIRS!.split(":")[0]!;
+  assert.ok(dataDir.startsWith(join(agentDir, "pi-gui", "worker-web")), dataDir);
+  const entry = readFileSync(join(dataDir, "applications", "pi-gui-chromium-temp-profile.desktop"), "utf8");
+  const shim = /^Exec=(\/\S+) %U$/m.exec(entry)?.[1];
+  assert.ok(shim && existsSync(shim), entry);
+  assert.equal(env.BROWSER, shim);
+  assert.equal(statSync(shim).mode & 0o111, 0o111);
+  const shimText = readFileSync(shim, "utf8");
+  assert.ok(shimText.includes(`exec '${process.execPath}' '${fileURLToPath(new URL("../bin/pi-gui-snap-chromium.mjs", import.meta.url))}' "$@"`), shimText);
+  assert.ok(shimText.includes(`PI_GUI_SNAP_CHROMIUM_LOG='${join(agentDir, "gui-snap-chromium.log")}'`), shimText);
+  const mimeapps = readFileSync(join(env.XDG_CONFIG_DIRS!.split(":")[0]!, "mimeapps.list"), "utf8");
+  assert.match(mimeapps, /\[Default Applications\]\nx-scheme-handler\/http=pi-gui-chromium-temp-profile\.desktop;/);
+  assert.match(mimeapps, /\[Removed Associations\][^[]*x-scheme-handler\/https=[^\n]*chromium_chromium\.desktop;/);
+
+  // Not offered (e.g. an unverified launcher): pi-gui's entry is refused too, and nothing moves the desktop's runtime.
+  const off = await guiProvider({}, { apps, snapChromium: () => ({ ok: false, reason: "its launcher differs from the verified one" }) });
+  const refusedProvider = off.request({ role: "implement", readOnly: false });
+  assert.match(refusedProvider.instructions, /Web browsers: none can run here/);
+  const [refused, snapRefused] = await runWorker(refusedProvider, [launch("pi-gui-chromium-temp-profile.desktop"), launch("chromium_chromium.desktop")]);
+  assert.equal(reachedServer(refused!), false);
+  assert.match(refused!.text, /snap Chromium with a temporary profile is not offered here/);
+  assert.match(snapRefused!.text, /is a snap.*e\.g\. Google Chrome/s);
+  const offEnv = payload((await runWorker(refusedProvider, [launch("org.kde.kwrite.desktop")]))[0]!.text).env;
+  assert.equal(offEnv.TMPDIR, process.env.TMPDIR ?? null);
+  assert.equal(offEnv.BROWSER!.endsWith("/true"), true, offEnv.BROWSER!);
+  // A read-only role still only observes; the user's opt-in does not use the temporary-profile entry.
+  const readOnly = request({ role: "verify", readOnly: true });
+  assert.ok(!readOnly.tools.includes(tool("act")));
+  const optedIn = (await guiProvider({ allowWorkerUserBrowserProfiles: true }, { apps, snapChromium: () => ({ ok: true, userRuntime }) })).request({ role: "implement", readOnly: false });
+  const [optedEnv] = await runWorker(optedIn, [launch("chromium_chromium.desktop")]);
+  assert.equal(payload(optedEnv!.text).env.TMPDIR, process.env.TMPDIR ?? null);
 });
 
 const fakeKrdpScript = fileURLToPath(new URL("./fixtures/fake-krdpserver.mjs", import.meta.url));
@@ -185,9 +371,10 @@ test("/gui view: a worker's private desktop over loopback RDP, stopped with the 
   const viewerReady = () => ({ ok: true, checks: [], missing: [], krdp, openssl: "/usr/bin/openssl" });
   let api: ExtensionAPI | undefined;
   const cfg = await mkdtemp(join(tmpdir(), "pi-gui-cfg-"));
+  await writeFile(join(cfg, "gui.config.json"), JSON.stringify({ env: { XDG_DATA_DIRS: await workerApps() } }));
   const main = await startSession([
     noMcpJson(), pi => { api = pi; },
-    createGuiExtension({ agentDir: cfg, resolve: resolveFake, prerequisites: ready, viewer: { prerequisites: viewerReady } }),
+    createGuiExtension({ snapChromium: noSnap, agentDir: cfg, resolve: resolveFake, prerequisites: ready, viewer: { prerequisites: viewerReady } }),
   ], []);
   const notes: { text: string; level?: string }[] = [];
   const gui = main.session.extensionRunner.getCommand("gui")!;
@@ -249,7 +436,7 @@ test("/gui view: missing krdp gives the install command", async () => {
   const missing = () => ({ ok: false, checks: [{ name: "krdpserver (KDE RDP server)", ok: false, detail: "not found", apt: "krdp" }], missing: ["krdpserver (KDE RDP server) (apt: krdp)"] });
   const { session } = await startSession([
     noMcpJson(),
-    createGuiExtension({ agentDir: await mkdtemp(join(tmpdir(), "pi-gui-cfg-")), resolve: resolveFake, prerequisites: ready, viewer: { prerequisites: missing } }),
+    createGuiExtension({ snapChromium: noSnap, agentDir: await mkdtemp(join(tmpdir(), "pi-gui-cfg-")), resolve: resolveFake, prerequisites: ready, viewer: { prerequisites: missing } }),
   ], []);
   const notes: { text: string; level?: string }[] = [];
   const gui = session.extensionRunner.getCommand("gui")!;

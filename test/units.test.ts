@@ -150,3 +150,10 @@ test("doctor output is summarised by section", () => {
     { section: "Virtual desktop (KWin)", status: "UNAVAILABLE" },
   ]);
 });
+
+test("config: allowWorkerUserBrowserProfiles is off by default and only the user may turn it on", () => {
+  assert.equal(DEFAULT_GUI_CONFIG.allowWorkerUserBrowserProfiles, false);
+  assert.deepEqual(validateGuiConfig({ allowWorkerUserBrowserProfiles: true }), { allowWorkerUserBrowserProfiles: true });
+  assert.throws(() => validateGuiConfig({ allowWorkerUserBrowserProfiles: true }, { project: true }), /only allowed in the user config/);
+  assert.throws(() => validateGuiConfig({ allowWorkerUserBrowserProfiles: "yes" }), /must be a boolean/);
+});
