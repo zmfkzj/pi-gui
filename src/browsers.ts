@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { chmodSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
 import { basename, delimiter, isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { DESKTOPS_DIR, snapChromiumReason } from "../bin/pi-gui-snap-chromium.mjs";
+import { DESKTOPS_DIR, snapChromiumReason, type AgentProfileUse } from "../bin/pi-gui-snap-chromium.mjs";
 
 /**
  * Web browsers on a worker's private desktop. The private desktop has its own XDG config/data/state directories (deleted
@@ -203,6 +203,30 @@ export function listBrowsers(env: BrowserEnv): BrowserVerdict[] {
 /** pi-gui's entry for the installed snap Chromium with a temporary profile (bin/pi-gui-snap-chromium.mjs). */
 export const SNAP_CHROMIUM_ID = "pi-gui-chromium-temp-profile.desktop";
 const SNAP_CHROMIUM_HINT = ` To use Chromium, launch ${SNAP_CHROMIUM_ID}: the same snap Chromium with a temporary profile of its own, removed when it closes.`;
+/**
+ * pi-gui's entry for the same snap Chromium with the user's opt-in agent profile (gui.config.json `workerBrowserProfile`):
+ * a persistent profile of the agents' own, which keeps its sign-ins across browser restarts and desktops.
+ */
+export const AGENT_PROFILE_ID = "pi-gui-chromium-agent-profile.desktop";
+
+/**
+ * Why a worker cannot open the agent profile `name` now, or undefined when it can: one browser per profile, on one
+ * desktop at a time. `ownTag`: this worker server's view tag (its desktop's launches carry it); `workerOf`: the name of
+ * the worker whose server has a tag.
+ */
+export function agentProfileBusy(name: string, use: AgentProfileUse | undefined, ownTag: string, workerOf: (tag: string) => string | undefined = () => undefined): string | undefined {
+  if (!use) return undefined;
+  const head = `launch_application ${AGENT_PROFILE_ID} is refused: the agent browser profile "${name}" is already open`;
+  if ("owner" in use && use.owner.tag === ownTag) {
+    return `${head} on this desktop (one browser per profile). Use that window: list_desktop {scope: "windows"}, then open a new tab (Ctrl+T) or type the address there.`;
+  }
+  const worker = "owner" in use && use.owner.tag ? workerOf(use.owner.tag) : undefined;
+  const where = worker ? `on worker ${worker}'s private desktop`
+    : "owner" in use ? `on another private desktop (${use.owner.display ?? "unknown display"}, not a worker of this Pi session)`
+    : "pid" in use ? `in a browser process (${use.pid}) that still runs with it`
+    : "on another desktop (a launch with it is starting)";
+  return `${head} ${where}. A profile can be open on one desktop at a time; Chromium would otherwise hand this launch to that browser on the other desktop. Wait until it is closed there or that desktop ends, then launch it again; if it stays busy, report that the agent profile is in use; or use ${SNAP_CHROMIUM_ID} (signed out) if the task does not need the saved sign-ins.`;
+}
 
 export function refusalText(verdict: BrowserVerdict & { disposable: false }, options: { snapChromium?: boolean } = {}): string {
   const instead = options.snapChromium
@@ -242,9 +266,14 @@ export function launcherReason(entry: DesktopEntry): string | undefined {
  * is a browser that would open the user's profile. {@link SNAP_CHROMIUM_ID} is allowed only when this desktop offers it
  * (`snapChromium`; its entry lives in pi-gui's own data dir of the desktop, not in `env`). Undefined: allowed.
  */
-export function checkWorkerLaunch(desktopId: string, env: BrowserEnv, options: { snapChromium?: boolean } = {}): string | undefined {
-  if ((desktopId.endsWith(".desktop") ? desktopId : `${desktopId}.desktop`) === SNAP_CHROMIUM_ID) {
+export function checkWorkerLaunch(desktopId: string, env: BrowserEnv, options: { snapChromium?: boolean; agentProfile?: () => string | undefined } = {}): string | undefined {
+  const id = desktopId.endsWith(".desktop") ? desktopId : `${desktopId}.desktop`;
+  if (id === SNAP_CHROMIUM_ID) {
     return options.snapChromium ? undefined : `launch_application ${desktopId} is refused on a worker's private desktop: snap Chromium with a temporary profile is not offered here (see /gui status for the reason).`;
+  }
+  // Offered with the user's workerBrowserProfile to writing roles; `agentProfile` says why it cannot open now (in use).
+  if (id === AGENT_PROFILE_ID) {
+    return options.agentProfile ? options.agentProfile() : `launch_application ${desktopId} is refused on a worker's private desktop: the agent browser profile is not offered here (it needs the user's workerBrowserProfile in gui.config.json, a writing role and snap Chromium; see /gui status).`;
   }
   const verdict = classifyLaunch(desktopId, env);
   if (!verdict.entry) {
@@ -301,9 +330,14 @@ export interface SnapChromiumLaunch { node: string; supervisor: string; log: str
 
 const shellQuote = (value: string) => `'${value.replace(/'/g, `'\\''`)}'`;
 
-/** The program of {@link SNAP_CHROMIUM_ID} and `$BROWSER`: one path, so `xdg-open`, GIO and KIO all reach the supervisor. */
-export function snapChromiumShim(launch: SnapChromiumLaunch): string {
-  return `#!/bin/sh\n# Written by pi-gui: snap Chromium with a temporary profile on a worker's private desktop.\nPI_GUI_SNAP_CHROMIUM_LOG=${shellQuote(launch.log)} exec ${shellQuote(launch.node)} ${shellQuote(launch.supervisor)} "$@"\n`;
+/**
+ * The program of {@link SNAP_CHROMIUM_ID} and `$BROWSER`: one path, so `xdg-open`, GIO and KIO all reach the supervisor.
+ * With `agentProfile`, the program of {@link AGENT_PROFILE_ID}; without, the profile variable is cleared, so the
+ * temporary entry never inherits one.
+ */
+export function snapChromiumShim(launch: SnapChromiumLaunch, agentProfile?: string): string {
+  const what = agentProfile ? `snap Chromium with the agent profile ${agentProfile}` : "snap Chromium with a temporary profile";
+  return `#!/bin/sh\n# Written by pi-gui: ${what} on a worker's private desktop.\nPI_GUI_SNAP_CHROMIUM_PROFILE=${shellQuote(agentProfile ?? "")} PI_GUI_SNAP_CHROMIUM_LOG=${shellQuote(launch.log)} exec ${shellQuote(launch.node)} ${shellQuote(launch.supervisor)} "$@"\n`;
 }
 
 /**
@@ -315,8 +349,16 @@ export const PLAIN_EXEC_PATH = /^\/[A-Za-z0-9_./+-]+$/;
 /** Where {@link webDefaultsEnv} puts the shim under `root` (the hash part has a fixed shape). */
 export const snapChromiumShimFits = (root: string) => PLAIN_EXEC_PATH.test(join(root, "0123456789abcdef", "bin", "pi-gui-snap-chromium"));
 
-export function snapChromiumEntry(shim: string): string {
+export function snapChromiumEntry(shim: string, agentProfile?: string): string {
   if (!PLAIN_EXEC_PATH.test(shim)) throw new Error(`the snap Chromium shim path ${JSON.stringify(shim)} needs quoting in an Exec line`);
+  if (agentProfile) {
+    // Launched by name only: not a handler of web links (those open signed out, in the temporary-profile entry).
+    return [
+      "[Desktop Entry]", "Type=Application", `Name=Chromium (agent profile ${agentProfile})`,
+      `Comment=The installed snap Chromium with the agents' persistent profile ${agentProfile} (not the user's); its sign-ins are kept`,
+      `Exec=${shim} %U`, "Terminal=false", "Icon=chromium", "Categories=Network;WebBrowser;", "StartupNotify=false", "",
+    ].join("\n");
+  }
   return [
     "[Desktop Entry]", "Type=Application", "Name=Chromium (temporary profile)",
     "Comment=The installed snap Chromium with a temporary profile of its own (not the user's), removed when it closes",
@@ -359,13 +401,15 @@ export function webDefaultsFiles(browsers: readonly BrowserVerdict[], noop = "/u
 /**
  * Write {@link webDefaultsFiles} under `root/<content hash>` (idempotent, shared by workers with the same browsers) and
  * return the environment that puts them first in the desktop's lookup. With `snapChromium`, pi-gui's snap Chromium entry
- * and its program (a shim that runs the supervisor) are written too.
+ * and its program (a shim that runs the supervisor) are written too; with its `agentProfile`, also the agent-profile entry
+ * and shim ({@link AGENT_PROFILE_ID}), which handles no links.
  */
-export function webDefaultsEnv(root: string, browsers: readonly BrowserVerdict[], env: NodeJS.ProcessEnv, snapChromium?: SnapChromiumLaunch): Record<string, string> {
+export function webDefaultsEnv(root: string, browsers: readonly BrowserVerdict[], env: NodeJS.ProcessEnv, snapChromium?: SnapChromiumLaunch & { agentProfile?: string }): Record<string, string> {
   // An absolute no-op program: xdg-mime accepts a handler only when its Exec resolves to a file.
   const noop = (env.PATH ?? "").split(delimiter).map(dir => join(dir, "true")).find(path => nodeFs.isFile(path)) ?? "/bin/true";
   const shimText = snapChromium ? snapChromiumShim(snapChromium) : undefined;
-  const dir = join(root, createHash("sha256").update(JSON.stringify({ browsers: browsers.map(verdict => [verdict.entry.id, verdict.disposable]), noop, shimText })).digest("hex").slice(0, 16));
+  const agentShimText = snapChromium?.agentProfile ? snapChromiumShim(snapChromium, snapChromium.agentProfile) : undefined;
+  const dir = join(root, createHash("sha256").update(JSON.stringify({ browsers: browsers.map(verdict => [verdict.entry.id, verdict.disposable]), noop, shimText, ...(agentShimText ? { agentShimText } : {}) })).digest("hex").slice(0, 16));
   const shim = join(dir, "bin", "pi-gui-snap-chromium");
   const files = webDefaultsFiles(browsers, noop, shimText ? shim : undefined);
   mkdirSync(join(dir, "config"), { recursive: true });
@@ -379,6 +423,12 @@ export function webDefaultsEnv(root: string, browsers: readonly BrowserVerdict[]
     writeFileSync(shim, shimText);
     chmodSync(shim, 0o755);
     writeFileSync(join(dir, "data", "applications", SNAP_CHROMIUM_ID), files.snapChromium);
+    if (agentShimText) {
+      const agentShim = join(dir, "bin", "pi-gui-snap-chromium-agent");
+      writeFileSync(agentShim, agentShimText);
+      chmodSync(agentShim, 0o755);
+      writeFileSync(join(dir, "data", "applications", AGENT_PROFILE_ID), snapChromiumEntry(agentShim, snapChromium!.agentProfile));
+    }
   }
   const allowed = browsers.find(verdict => verdict.disposable);
   const program = allowed?.entry.exec ? execProgram(allowed.entry.exec) : files.snapChromium ? shim : undefined;

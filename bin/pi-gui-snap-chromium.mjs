@@ -24,11 +24,19 @@
 // - computer-use-mcp's runner stops every process carrying its isolation marker with TERM and, 0.1 s later, KILL. The
 //   browser runs without the marker under this supervisor, which stops it when the private desktop ends and removes
 //   the launch directory (profile included). Signals go only to the processes of the launch's own systemd scope.
+// - Agent profile (opt-in, the user's gui.config.json `workerBrowserProfile`; PROFILE_ENV names it): the same launch,
+//   but Chromium's profile is the persistent `$SNAP_USER_COMMON/pi-gui-profiles/<name>/chromium` (next to, never inside,
+//   the user's own `$SNAP_USER_COMMON/chromium`). The launch directory still holds everything else and is removed as
+//   above; the profile stays. One browser per profile: the supervisor holds an abstract socket named after the profile
+//   for its whole life (the kernel releases it when the supervisor dies), so a launch on another desktop is refused
+//   instead of Chromium handing it to the browser already running on the first desktop.
 //
 // Stages: the desktop entry runs this file (stage "launch", inside the private desktop, marked); it checks everything,
 // then starts itself detached without the marker (stage "supervise") and exits.
 
 import { spawn } from "node:child_process";
+import { createServer } from "node:net";
+import { userInfo } from "node:os";
 import { createHash, randomUUID } from "node:crypto";
 import {
   appendFileSync, chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync,
@@ -47,6 +55,9 @@ export const LAUNCH_PREFIX = "pi-gui-launch-";
 export const STAGE_ENV = "PI_GUI_SNAP_CHROMIUM_STAGE";
 export const MARKER_ENV = "PI_GUI_SNAP_CHROMIUM_MARKER";
 export const LOG_ENV = "PI_GUI_SNAP_CHROMIUM_LOG";
+/** The agent profile a launch uses (unset or empty: a temporary profile). */
+export const PROFILE_ENV = "PI_GUI_SNAP_CHROMIUM_PROFILE";
+const VIEW_TAG_ENV = "PI_GUI_VIEW_TAG";
 const RUNNER_MARKER = "COMPUTER_USE_MCP_ISOLATION_MARKER";
 /** The script's exit code when it refuses to start Chromium. */
 export const REFUSED_EXIT = 97;
@@ -80,45 +91,65 @@ export const BROWSER_FLAGS = [
   "--disable-audio-output",
   "--disable-audio-input",
   "--use-fake-device-for-media-stream",
-  // The profile lives on the user's runtime tmpfs: bounded cache.
+  // The profile lives on the user's runtime tmpfs (an agent profile: in the user's home): bounded cache.
   "--disk-cache-size=268435456",
 ];
 
+/** Agent profiles: `<snap user common>/pi-gui-profiles/<name>`, Chromium's profile being `<name>/chromium`. */
+export const PROFILES_DIR = "pi-gui-profiles";
+export const PROFILE_NAME = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
+
 /**
  * The script `snap run --shell chromium -c` runs inside the confinement, after the app's command chain:
- * `bash -c IN_SNAP_SCRIPT pi-gui-snap-chromium <revision> <launch dir> <flags…> [-- URLs…]`; `revision` is the one whose
- * command chain was verified (snap run always runs `current`, which a refresh may switch at any time). Any failed check exits with
+ * `bash -c IN_SNAP_SCRIPT pi-gui-snap-chromium <revision> <launch dir> <profile name or -> <flags…> [-- URLs…]`; `revision`
+ * is the one whose command chain was verified (snap run always runs `current`, which a refresh may switch at any time).
+ * `-`: the profile is the launch's own empty `config/chromium`; a name: the agent profile
+ * `$SNAP_USER_COMMON/pi-gui-profiles/<name>/chromium`, which pi-gui created. Any failed check exits with
  * {@link REFUSED_EXIT} before Chromium is started. Test seams: `program` (default: the snap's chrome) and `dirPrefix`
  * (a shell word for the launch directory's prefix; default: this user's snap runtime dir and {@link LAUNCH_PREFIX}).
  */
 export function inSnapScript(options = {}) {
   const program = options.program ?? '"$SNAP/usr/lib/chromium-browser/chrome"';
   const dirPrefix = options.dirPrefix ?? `"/run/user/$(id -u)/snap.chromium/${LAUNCH_PREFIX}"`;
+  const owned = `if [ -L "$d" ] || [ ! -d "$d" ] || [ ! -O "$d" ] || [ ! -r "$d" ] || [ ! -x "$d" ]; then fail "$d is not a directory of this user"; fi`;
   return `set -u
 fail() { printf 'pi-gui: refusing to start Chromium: %s\\n' "$1" >&2; exit ${REFUSED_EXIT}; }
-[ "$#" -ge 2 ] || fail "no revision or launch directory"
-revision=$1; dir=$2; shift 2
+[ "$#" -ge 3 ] || fail "no revision, launch directory or profile"
+revision=$1; dir=$2; name=$3; shift 3
 [ -n "\${SNAP_REVISION:-}" ] && [ "$SNAP_REVISION" = "$revision" ] || fail "snap revision \${SNAP_REVISION:-?} is not the verified $revision"
 [ "\${SNAP_INSTANCE_NAME:-}" = chromium ] || fail "not the chromium snap"
 prefix=${dirPrefix}
 case "$dir" in "$prefix" | "$prefix"*/*) fail "unexpected launch directory $dir" ;; "$prefix"*) ;; *) fail "unexpected launch directory $dir" ;; esac
 case "$dir" in *[!A-Za-z0-9/._-]*|*/../*|*/..|*/./*) fail "unexpected launch directory $dir" ;; esac
 for d in "$dir" ${LAUNCH_SUBDIRS.map(sub => `"$dir/${sub}"`).join(" ")}; do
-  if [ -L "$d" ] || [ ! -d "$d" ] || [ ! -O "$d" ] || [ ! -r "$d" ] || [ ! -x "$d" ]; then fail "$d is not a directory of this user"; fi
+  ${owned}
 done
 [ "$(cd "$dir" && pwd -P)" = "$dir" ] || fail "$dir is not a canonical path"
-entries=$(ls -A "$dir/config/chromium") || fail "$dir/config/chromium cannot be listed"
-[ -z "$entries" ] || fail "$dir/config/chromium is not empty"
+if [ "$name" = - ]; then
+  config="$dir/config"
+  entries=$(ls -A "$config/chromium") || fail "$config/chromium cannot be listed"
+  [ -z "$entries" ] || fail "$config/chromium is not empty"
+else
+  case "$name" in [A-Za-z0-9]*) ;; *) fail "unexpected profile name $name" ;; esac
+  case "$name" in *[!A-Za-z0-9_-]*) fail "unexpected profile name $name" ;; esac
+  [ "\${#name}" -le 64 ] || fail "unexpected profile name $name"
+  [ -n "\${SNAP_USER_COMMON:-}" ] || fail "SNAP_USER_COMMON is not set"
+  config="$SNAP_USER_COMMON/${PROFILES_DIR}/$name"
+  for d in "$SNAP_USER_COMMON/${PROFILES_DIR}" "$config" "$config/chromium"; do
+    ${owned}
+  done
+  [ "$(cd "$config/chromium" && pwd -P)" = "$config/chromium" ] || fail "$config/chromium is not a canonical path"
+fi
 set -C
-for d in "$dir/config/chromium" "$dir/tmp" "$dir/home" "$dir/cache"; do
+for d in "$config/chromium" "$dir/tmp" "$dir/home" "$dir/cache"; do
   probe="$d/.pi-gui-probe.$$"
   { : > "$probe" && rm -f "$probe"; } 2>/dev/null || fail "$d is not writable inside the snap"
 done
 # Chromium's default profile is $CHROME_CONFIG_HOME/chromium: from here on, that is this launch's profile as well.
-export CHROME_CONFIG_HOME="$dir/config" HOME="$dir/home" XDG_CACHE_HOME="$dir/cache" TMPDIR="$dir/tmp"
+export CHROME_CONFIG_HOME="$config" HOME="$dir/home" XDG_CACHE_HOME="$dir/cache" TMPDIR="$dir/tmp"
 export BREAKPAD_DUMP_LOCATION="$dir/crash" CHROME_WRAPPER=${SNAP_BIN} CHROME_VERSION_EXTRA=snap
 unset CHROME_USER_DATA_DIR CHROMIUM_FLAGS
-builtin exec ${program} --user-data-dir="$dir/config/chromium" "$@"
+builtin exec ${program} --user-data-dir="$config/chromium" "$@"
 `;
 }
 
@@ -289,10 +320,78 @@ export function launchDir(snapDir, options = {}) {
   return dir;
 }
 
+// ---------------------------------------------------------------- agent profiles (opt-in, persistent)
+
+/** Where the agent profile `name` lives: the snap's per-user common dir (`$SNAP_USER_COMMON`, kept across refreshes). */
+export function agentProfilePaths(name, home = userInfo().homedir) {
+  const root = join(home, "snap", "chromium", "common", PROFILES_DIR);
+  return { root, config: join(root, name), profile: join(root, name, "chromium") };
+}
+
+/**
+ * Create (0700) and check the agent profile `name`: real private directories of this user on a canonical path (no link
+ * anywhere, so the in-snap script and the supervisor name the same directory). Returns its paths; throws when it cannot.
+ */
+export function prepareAgentProfile(name, options = {}) {
+  if (!PROFILE_NAME.test(name)) throw new Error(`unexpected agent profile name ${JSON.stringify(name)}`);
+  const uid = options.uid ?? process.getuid();
+  const paths = agentProfilePaths(name, options.home);
+  mkdirSync(paths.profile, { recursive: true, mode: 0o700 });
+  for (const path of [paths.root, paths.config, paths.profile]) {
+    const stat = lstatSync(path);
+    if (!stat.isDirectory() || stat.uid !== uid || (stat.mode & 0o077) !== 0) throw new Error(`${path} is not a private (0700) directory of this user`);
+  }
+  if (realpathSync(paths.profile) !== paths.profile) throw new Error(`${paths.profile} is not a canonical path`);
+  if (!/^[A-Za-z0-9/._-]+$/.test(paths.profile)) throw new Error(`${paths.profile} has characters the in-snap check refuses`);
+  return paths;
+}
+
+/** The abstract socket a supervisor holds while it uses the agent profile `name` (released by the kernel when it dies). */
+export const profileLockName = (name, uid = process.getuid()) => `pi-gui-agent-profile/${uid}/${name}`;
+
+/** Take the agent profile's lock: the listening server, or undefined when another process holds it. */
+export function lockAgentProfile(name, uid = process.getuid()) {
+  return new Promise((resolve, reject) => {
+    const server = createServer(socket => socket.destroy());
+    server.once("error", error => (error?.code === "EADDRINUSE" ? resolve(undefined) : reject(error)));
+    server.listen(`\0${profileLockName(name, uid)}`, () => { server.unref(); resolve(server); });
+  });
+}
+
+/**
+ * Who uses the agent profile `name` now, or undefined when nobody does: a launch whose record names it and whose
+ * supervisor, launcher, browser or scope still lives (`owner`: that record, with its desktop's runtime and view tag), the
+ * profile's lock (another supervisor taking it), or a browser process running with it (left by a killed supervisor).
+ * `ownLock`: the caller holds the lock itself.
+ */
+export function agentProfileUse(name, options = {}) {
+  const uid = options.uid ?? process.getuid();
+  const proc = options.proc ?? "/proc";
+  const snapDir = options.snapDir ?? join(`/run/user/${uid}`, "snap.chromium");
+  let entries = [];
+  try { entries = readdirSync(snapDir).filter(entry => entry.startsWith(LAUNCH_PREFIX)); } catch { /* none */ }
+  for (const entry of entries) {
+    const owner = readRecord(join(snapDir, entry));
+    if (owner?.agentProfile === name && launchLives(owner, proc, options.cgroupRoot)) return { owner, dir: join(snapDir, entry) };
+  }
+  if (!options.ownLock) {
+    let table = "";
+    try { table = readFileSync(options.netUnix ?? "/proc/net/unix", "utf8"); } catch { /* unknown: the supervisor's own lock decides */ }
+    if (table.split("\n").some(line => line.endsWith(` @${profileLockName(name, uid)}`))) return { lock: true };
+  }
+  const profile = options.profile ?? agentProfilePaths(name, options.home).profile;
+  const program = options.program ?? BROWSER_PROGRAM;
+  for (const pid of pids(proc)) {
+    const args = cmdline(pid, proc);
+    if (args[0] && program.test(args[0]) && !args.some(arg => arg.startsWith("--type=")) && args.includes(`--user-data-dir=${profile}`)) return { pid };
+  }
+  return undefined;
+}
+
 /** Environment of the snap: the private desktop's, with every route to the physical session or the marker removed. */
 export function browserEnvironment(env, desktop, dir) {
   const out = { ...env };
-  for (const name of [RUNNER_MARKER, MARKER_ENV, STAGE_ENV, LOG_ENV, "DISPLAY", "XAUTHORITY", "WAYLAND_SOCKET", "CHROMIUM_FLAGS", "TMPDIR",
+  for (const name of [RUNNER_MARKER, MARKER_ENV, STAGE_ENV, LOG_ENV, PROFILE_ENV, "DISPLAY", "XAUTHORITY", "WAYLAND_SOCKET", "CHROMIUM_FLAGS", "TMPDIR",
     "CHROME_USER_DATA_DIR", "CHROME_CONFIG_HOME", "DBUS_STARTER_ADDRESS", "DBUS_STARTER_BUS_TYPE", "PULSE_SERVER", "PULSE_RUNTIME_PATH",
     // Shell start-up hooks: the command chain and pi-gui's script run under bash.
     "BASH_ENV", "ENV", "SHELLOPTS", "BASHOPTS", "CDPATH", "GLOBIGNORE", "PROMPT_COMMAND"]) delete out[name];
@@ -324,13 +423,14 @@ export function browserArguments(urls) {
  * The whole command line of a launch: the snap's shell in a fresh systemd scope. systemd-run would expand `${…}` in the
  * arguments (the script's) with its own environment, so expansion is turned off.
  */
-export function launchCommand(unit, revision, dir, args) {
-  const [snap, snapArgs] = snapCommand(revision, dir, args);
+export function launchCommand(unit, revision, dir, args, profileName = "-") {
+  const [snap, snapArgs] = snapCommand(revision, dir, args, inSnapScript(), profileName);
   return [SYSTEMD_RUN, ["--user", "--scope", "--quiet", "--collect", "--expand-environment=no", `--unit=${unit}`, "--", snap, ...snapArgs]];
 }
 
-export function snapCommand(revision, dir, args, script = inSnapScript()) {
-  return [SNAP_COMMAND, ["run", "--shell", "chromium", "-c", script, "pi-gui-snap-chromium", revision, dir, ...args]];
+/** `profileName`: an agent profile, or `-` for the launch's own temporary profile. */
+export function snapCommand(revision, dir, args, script = inSnapScript(), profileName = "-") {
+  return [SNAP_COMMAND, ["run", "--shell", "chromium", "-c", script, "pi-gui-snap-chromium", revision, dir, profileName, ...args]];
 }
 
 // ---------------------------------------------------------------- processes
@@ -409,10 +509,17 @@ export function removeLaunchDir(dir) {
 const record = dir => join(dir, "owner.json");
 export function readRecord(dir) { try { return JSON.parse(readFileSync(record(dir), "utf8")); } catch { return undefined; } }
 function writeRecord(dir, value) { writeFileSync(record(dir), `${JSON.stringify(value)}\n`, { mode: 0o600 }); }
+/** Whether anything of a launch still runs: its supervisor, browser, launcher or a process of its scope. */
+function launchLives(owner, proc = "/proc", cgroupRoot = CGROUP_ROOT) {
+  return (typeof owner.pid === "number" && alive(owner.pid, owner.start, proc)) || (owner.browser && alive(owner.browser.pid, owner.browser.start, proc))
+    || (owner.launcher && alive(owner.launcher.pid, owner.launcher.start, proc))
+    || (owner.scope && scopeProcs(owner.scope, cgroupRoot).length > 0);
+}
 
 /**
  * Launch directories of earlier launches whose supervisor and processes are gone (killed before it could clean up):
- * removed, profile included. Only `pi-gui-launch-*` directories of this user; never one with a live owner.
+ * removed, profile included (an agent profile is not in it). Only `pi-gui-launch-*` directories of this user; never one
+ * with a live owner.
  */
 export function sweepStale(snapDir, proc = "/proc", log = () => {}, cgroupRoot = CGROUP_ROOT) {
   let entries = [];
@@ -427,9 +534,7 @@ export function sweepStale(snapDir, proc = "/proc", log = () => {}, cgroupRoot =
     if (!owner || typeof owner.pid !== "number") {
       // Without its record the directory is being created, or its supervisor died before writing anything.
       if (Date.now() - stat.mtimeMs < 60_000) continue;
-    } else if (alive(owner.pid, owner.start, proc) || (owner.browser && alive(owner.browser.pid, owner.browser.start, proc))
-      || (owner.launcher && alive(owner.launcher.pid, owner.launcher.start, proc))
-      || (owner.scope && scopeProcs(owner.scope, cgroupRoot).length > 0)) {
+    } else if (launchLives(owner, proc, cgroupRoot)) {
       continue;
     }
     if (removeLaunchDir(dir)) log(`removed the stale launch directory ${dir}`);
@@ -444,11 +549,12 @@ const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 /**
  * Run the snap browser for one launch and clean up. Options (test seams): env, urls, snapBin (a stand-in for
  * /usr/bin/snap, run directly instead of through a systemd scope; with it, `inSnap` options for {@link inSnapScript}),
- * browserProgram, proc, cgroupRoot, uid, userRuntime, log, pollMs, startTimeoutMs, stopTimeoutMs, skipSnapCheck, statfs,
- * onState.
+ * browserProgram, proc, cgroupRoot, uid, userRuntime, home, log, pollMs, startTimeoutMs, stopTimeoutMs, skipSnapCheck,
+ * statfs, onState. `profileName`: an agent profile instead of a temporary one.
  *
  * Ownership: the processes of this launch are the systemd scope this supervisor creates (unit name with a fresh UUID),
- * or, without a scope (tests), the descendants of the process it spawned. Its files are its launch directory.
+ * or, without a scope (tests), the descendants of the process it spawned. Its files are its launch directory; an agent
+ * profile is used, never removed, and held (lock, record) until everything of the launch has stopped.
  */
 export async function supervise(options) {
   const env = options.env ?? process.env;
@@ -473,10 +579,28 @@ export async function supervise(options) {
   const noRoom = runtimeSpaceReason(snapDir, { statfs: options.statfs });
   if (noRoom) { log(`refused: ${noRoom}`); return 1; }
   sweepStale(snapDir, proc, log, cgroupRoot);
+  const name = options.profileName || undefined;
+  let agent, lock;
+  if (name !== undefined) {
+    try { agent = prepareAgentProfile(name, { uid: options.uid, home: options.home }); } catch (error) { log(`refused: the agent profile: ${error.message}`); return 1; }
+    try { lock = await lockAgentProfile(name, desktop.uid); } catch (error) { log(`refused: cannot lock the agent profile ${name} (${error.message})`); return 1; }
+    // With the lock taken by someone else, its record (when there is one yet) names the holder.
+    const use = agentProfileUse(name, { uid: desktop.uid, proc, cgroupRoot, snapDir, profile: agent.profile, program: options.browserProgram ?? BROWSER_PROGRAM, ownLock: true })
+      ?? (lock ? undefined : { lock: true });
+    if (use) {
+      lock?.close();
+      const by = use.owner ? `the launch ${use.dir} on ${use.owner.display ?? use.owner.runtime}` : use.pid ? `the browser process ${use.pid}` : "another launch (it holds the profile's lock)";
+      log(`refused: the agent profile ${name} is in use by ${by}; one browser per profile, so this launch would be handed to that browser`);
+      return 1;
+    }
+  }
   let dir;
-  try { dir = launchDir(snapDir, { uid: options.uid }); } catch (error) { log(`refused: cannot create the launch directory (${error.message})`); return 1; }
-  const profile = profileOf(dir);
-  const state = { pid: process.pid, start: processInfo(process.pid, proc)?.start, runtime: desktop.runtime, profile, created: new Date().toISOString() };
+  try { dir = launchDir(snapDir, { uid: options.uid }); } catch (error) { lock?.close(); log(`refused: cannot create the launch directory (${error.message})`); return 1; }
+  const profile = agent ? agent.profile : profileOf(dir);
+  const state = {
+    pid: process.pid, start: processInfo(process.pid, proc)?.start, runtime: desktop.runtime, profile, created: new Date().toISOString(),
+    ...(agent ? { agentProfile: name, display: desktop.display, ...(env[VIEW_TAG_ENV] ? { tag: env[VIEW_TAG_ENV] } : {}) } : {}),
+  };
   writeRecord(dir, state);
 
   // `snap run` moves itself into a transient systemd scope through the session bus, which here is not the user's (no
@@ -485,8 +609,8 @@ export async function supervise(options) {
   const unit = `${SCOPE_PREFIX}${randomUUID()}.scope`;
   const snap = options.snapBin ?? SNAP_COMMAND;
   const [command, commandArgs] = options.snapBin
-    ? [options.snapBin, snapCommand(revision, dir, args, inSnapScript(options.inSnap))[1]]
-    : launchCommand(unit, revision, dir, args);
+    ? [options.snapBin, snapCommand(revision, dir, args, inSnapScript(options.inSnap), name ?? "-")[1]]
+    : launchCommand(unit, revision, dir, args, name ?? "-");
   const childEnv = { ...browserEnvironment(env, desktop, dir), XDG_RUNTIME_DIR: desktop.userRuntime };
   const child = spawn(command, commandArgs, { env: childEnv, stdio: ["ignore", options.stdio ?? "ignore", options.stdio ?? "ignore"] });
   let exited;
@@ -578,9 +702,12 @@ export async function supervise(options) {
       // Keep the directory: a process of the launch may still use it; the next launch removes it once they are gone.
       try { writeRecord(dir, { ...state, pid: -1, supervisorExited: true }); } catch (error) { log(`cannot update the record in ${dir}: ${error.message}`); }
     }
+    // Only now may another launch use the agent profile (with processes left, their record still names it).
+    lock?.close();
   }
   const refused = exited?.code === REFUSED_EXIT && !state.browser;
-  log(`${refused ? "the in-snap check refused to start Chromium" : `the browser exited (${exited ? exited.signal ?? `code ${exited.code}` : "unknown"})`}; ${state.unclean || !exited ? `kept ${dir}` : `removed ${dir} (profile included)`}`);
+  const kept = agent ? `removed ${dir}; the agent profile ${agent.profile} is kept` : `removed ${dir} (profile included)`;
+  log(`${refused ? "the in-snap check refused to start Chromium" : `the browser exited (${exited ? exited.signal ?? `code ${exited.code}` : "unknown"})`}; ${state.unclean || !exited ? `kept ${dir}` : kept}`);
   return state.unsafe || refused || !state.browser ? 1 : exited?.code ?? 1;
 }
 
@@ -601,7 +728,7 @@ async function main(argv, env) {
     // The browser's own output (errors of snap, the in-snap check and Chromium) goes to the same log.
     let output = "ignore";
     try { if (env[LOG_ENV]) output = openSync(env[LOG_ENV], "a", 0o600); } catch { /* no log */ }
-    return supervise({ env, urls: argv, log, stdio: output });
+    return supervise({ env, urls: argv, log, stdio: output, profileName: env[PROFILE_ENV] || undefined });
   }
   // Stage "launch": check here (a refusal fails the launch), then supervise from a process without the runner's marker.
   const desktop = privateDesktop(env);
@@ -609,6 +736,7 @@ async function main(argv, env) {
   const reason = snapChromiumReason();
   if (reason) { log(`refused: snap Chromium ${reason}`); return 1; }
   try { browserArguments(argv); } catch (error) { log(`refused: ${error.message}`); return 1; }
+  if (env[PROFILE_ENV] && !PROFILE_NAME.test(env[PROFILE_ENV])) { log(`refused: unexpected agent profile name ${JSON.stringify(env[PROFILE_ENV])}`); return 1; }
   const childEnv = { ...env, [STAGE_ENV]: "supervise", [MARKER_ENV]: desktop.marker };
   delete childEnv[RUNNER_MARKER];
   const child = spawn(process.execPath, [fileURLToPath(import.meta.url), ...argv], { env: childEnv, detached: true, stdio: "ignore" });

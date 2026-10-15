@@ -13,10 +13,15 @@
 // S3 the desktop ends (worker session shutdown): the same, within the timeout, and no supervisor is left.
 // S4 forced stop: supervisor and every process of the scope SIGKILLed → the launch directory is left; the next launch
 //    removes it.
+// P1-P4 the opt-in agent profile (workerBrowserProfile, a test profile of its own): a synthetic expiring cookie of a
+//    loopback site survives a browser restart (P1) and a new desktop (P4); while it is open, a second launch on the same
+//    or another desktop is refused before it runs (P3). Only `cookie: present|absent` is ever shown or kept.
 // The user's Chromium profile content is never read: only process tables, sockets, open-file names and its lock link.
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, readlinkSync, writeFileSync } from "node:fs";
+import { randomBytes } from "node:crypto";
+import { createServer } from "node:http";
+import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, readlinkSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { fauxAssistantMessage, fauxProvider, fauxToolCall, InMemoryCredentialStore, type FauxResponseFactory } from "@earendil-works/pi-ai";
@@ -25,7 +30,8 @@ import {
   type AgentSession, type ExtensionAPI, type ExtensionFactory,
 } from "@earendil-works/pi-coding-agent";
 import { mcpToolName } from "../../src/backend.ts";
-import { SNAP_CHROMIUM_ID } from "../../src/browsers.ts";
+import { AGENT_PROFILE_ID, SNAP_CHROMIUM_ID } from "../../src/browsers.ts";
+import { agentProfilePaths } from "../../bin/pi-gui-snap-chromium.mjs";
 import { createGuiExtension } from "../../src/index.ts";
 import { CAPABILITY_CHANNEL, type CapabilityProvider } from "../../src/worker.ts";
 
@@ -34,6 +40,7 @@ mkdirSync(OUT, { recursive: true });
 const AGENT_DIR = join(OUT, "agent");
 mkdirSync(AGENT_DIR, { recursive: true });
 const PAGE = "https://example.com/";
+const AGENT_PROFILE = "pi-gui-live-test";
 const uid = process.getuid!();
 const USER_RUNTIME = `/run/user/${uid}`;
 const SNAP_RUNTIME = join(USER_RUNTIME, "snap.chromium");
@@ -107,7 +114,8 @@ function descendants(root: number): number[] {
 const userBrowsers = () => pids().filter(pid => { const a = args(pid); return CHROME.test(a[0] ?? "") && !a[0]!.endsWith("_crashpad_handler") && !a.some(arg => arg.startsWith("--type=") || arg.startsWith("--user-data-dir="));
 }).map(pid => ({ pid, start: stat(pid)!.start }));
 /** Supervisors (bin/pi-gui-snap-chromium.mjs, stage supervise) started from this test's agent dir. */
-const supervisors = () => pids().filter(pid => args(pid).some(arg => arg.endsWith("pi-gui-snap-chromium.mjs")) && environ(pid).includes("PI_GUI_SNAP_CHROMIUM_STAGE=supervise"));
+const supervisors = () => pids().filter(pid => args(pid).some(arg => arg.endsWith("pi-gui-snap-chromium.mjs")) && environ(pid).includes("PI_GUI_SNAP_CHROMIUM_STAGE=supervise")
+  && environ(pid).includes(`PI_GUI_SNAP_CHROMIUM_LOG=${join(AGENT_DIR, "gui-snap-chromium.log")}`));
 const launchDirs = () => { try { return readdirSync(SNAP_RUNTIME).filter(name => name.startsWith("pi-gui-")).map(name => join(SNAP_RUNTIME, name)); } catch { return []; } };
 const record = (dir: string) => { try { return JSON.parse(readFileSync(join(dir, "owner.json"), "utf8")) as { pid: number; scope?: string; launcher?: { pid: number; start: string }; browser?: { pid: number; start: string; profile: string; singleton?: string } }; } catch { return undefined; } };
 const scopeProcs = (scope: string) => { try { return readFileSync(join("/sys/fs/cgroup", scope, "cgroup.procs"), "utf8").split("\n").filter(Boolean).map(Number); } catch { return []; } };
@@ -148,8 +156,8 @@ function shot(r: Rec, result: Result, name: string) {
   r.shots.push(file);
 }
 
-/** Launch the entry and wait for its window. */
-async function* launchFlow(r: Rec): Flow {
+/** Launch the entry (default: the temporary-profile one) and wait for its window. */
+async function* launchFlow(r: Rec, entry = SNAP_CHROMIUM_ID): Flow {
   let result = yield* call(r, "list_desktop", { scope: "applications", limit: 100 }, "list applications");
   let cursor = ids(result.text, "cur")[0];
   let listed = result.text.includes(SNAP_CHROMIUM_ID);
@@ -163,7 +171,7 @@ async function* launchFlow(r: Rec): Flow {
   const refused = yield* call(r, "launch_application", { desktop_id: "chromium_chromium.desktop" }, "launch the snap's own entry");
   r.errors.splice(r.errors.findIndex(error => error.startsWith("launch the snap's own entry")) >>> 0, 1);
   r.texts.push(`refused: ${refused.text}`);
-  yield* call(r, "launch_application", { desktop_id: SNAP_CHROMIUM_ID }, `launch ${SNAP_CHROMIUM_ID}`);
+  yield* call(r, "launch_application", { desktop_id: entry }, `launch ${entry}`);
   for (let attempt = 0; attempt < 60 && !r.target; attempt++) {
     if (attempt) await sleep(1000);
     result = yield* call(r, "list_desktop", { scope: "windows" }, "list windows");
@@ -173,6 +181,56 @@ async function* launchFlow(r: Rec): Flow {
   }
   if (!r.target) r.errors.push("no browser window");
   return "launched";
+}
+
+/** One launch_application whose refusal is expected: its text is kept in r.texts, not counted as an error. */
+async function* refusedLaunchFlow(r: Rec, entry: string): Flow {
+  const result = yield* call(r, "launch_application", { desktop_id: entry }, `launch ${entry} (expected refusal)`);
+  r.errors.splice(r.errors.findIndex(error => error.startsWith(`launch ${entry} (expected refusal)`)) >>> 0, 1);
+  r.texts.push(`${result.isError ? "refused" : "NOT REFUSED"}: ${result.text}`);
+  return "tried";
+}
+
+/** Open `url` through the new-tab page's search box and wait until the page text matches `expect`. */
+async function* visitFlow(r: Rec, url: string, expect: RegExp, name: string): Flow {
+  const target = r.target!;
+  let result = yield* call(r, "observe", { target, view: "screenshot", crop: "target_window" }, "observe new window");
+  const size = pngSize(result.images[0]!.data);
+  const box = { x: Math.floor(size.width / 2), y: Math.floor(size.height * 0.376) };
+  yield* call(r, "act", { target, source_observation: { observation_id: ids(result.text, "obs")[0]!, frame_id: ids(result.text, "frame")[0]! }, operation: { type: "keyboard", focus: { type: "point", ...box }, events: [{ type: "type", text: url }] } }, `type ${url}`);
+  result = yield* call(r, "observe", { target, view: "screenshot", crop: "target_window" }, "observe the typed address");
+  yield* call(r, "act", { target, source_observation: { observation_id: ids(result.text, "obs")[0]!, frame_id: ids(result.text, "frame")[0]! }, operation: { type: "keyboard", focus: { type: "point", ...box }, events: [{ type: "press", key: "Return" }] } }, "Enter");
+  let page = "";
+  for (let attempt = 0; attempt < 20 && !expect.test(page); attempt++) {
+    await sleep(1000);
+    result = yield* call(r, "observe", { target, view: "both", crop: "target_window", accessibility: { scope: "full", limits: { text_limit: 4000, max_nodes: 600 } } }, `observe ${name}`);
+    page = result.text;
+  }
+  shot(r, result, name);
+  r.texts.push(page);
+  if (!expect.test(page)) r.errors.push(`${name}: the page did not show ${expect}`);
+  return "visited";
+}
+
+/**
+ * A synthetic site on loopback for the agent profile: /set sets a persistent test cookie (an expiring random token,
+ * never shown, logged or saved), /check says only whether the browser sent it back. Nothing of a real account.
+ */
+async function cookieSite(): Promise<{ origin: string; close: () => void }> {
+  const token = randomBytes(16).toString("hex");
+  const page = (text: string) => `<!doctype html><title>${text}</title><h1>${text}</h1>`;
+  const server = createServer((request, response) => {
+    const sent = (request.headers.cookie ?? "").split(/;\s*/).includes(`pi_gui_live=${token}`);
+    if (request.url === "/set") {
+      response.writeHead(200, { "content-type": "text/html", "set-cookie": `pi_gui_live=${token}; Max-Age=3600; Path=/; HttpOnly; SameSite=Lax` });
+      response.end(page("pi-gui-live cookie: set"));
+    } else {
+      response.writeHead(200, { "content-type": "text/html" });
+      response.end(page(`pi-gui-live cookie: ${sent ? "present" : "absent"}`));
+    }
+  });
+  await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+  return { origin: `http://127.0.0.1:${(server.address() as { port: number }).port}`, close: () => server.close() };
 }
 
 /** Open the public test page through the address bar and follow its link; read the page back through accessibility. */
@@ -236,17 +294,18 @@ async function until(what: string, check: () => boolean, ms = 30_000) {
   throw new Error(`timed out: ${what}`);
 }
 
-function checkIsolation(launch: Launch, users: { pid: number; start: string }[]) {
+/** `profile`: the launch's own temporary profile, or the agent profile. */
+function checkIsolation(launch: Launch, users: { pid: number; start: string }[], profile = join(launch.dir, "config", "chromium")) {
   const browser = launch.browser.pid;
   // Every process of the launch: its systemd scope (snap.chromium.chromium-<uuid>.scope, created by the supervisor).
   const tree = new Set(scopeProcs(launch.scope));
   assert.ok(tree.has(browser) && tree.has(launch.launcher.pid), `scope ${launch.scope}: ${[...tree].join(",")}`);
   assert.match(launch.scope, /\/snap\.chromium\.chromium-[0-9a-f-]{36}\.scope$/);
   const chromeArgs = args(browser);
-  // The profile pi-gui created for this launch, on the host's view of the snap's runtime dir; Chromium's default profile
+  // The profile pi-gui created for this launch (or the agent profile), on the host's view; Chromium's default profile
   // in this process is the same directory (the in-snap script set CHROME_CONFIG_HOME; asserted in test/snap-chromium.test.ts
   // inside the real confinement, since Chromium makes its own /proc environ unreadable).
-  assert.equal(launch.browser.profile, join(launch.dir, "config", "chromium"));
+  assert.equal(launch.browser.profile, profile);
   assert.ok(launch.dir.startsWith(`${SNAP_RUNTIME}/pi-gui-launch-`), launch.dir);
   assert.deepEqual(chromeArgs.filter(arg => arg.startsWith("--user-data-dir=")), [`--user-data-dir=${launch.browser.profile}`], chromeArgs.join(" "));
   assert.ok(existsSync(join(launch.browser.profile, "Default")), "the browser writes its own profile");
@@ -277,7 +336,12 @@ function checkIsolation(launch: Launch, users: { pid: number; start: string }[])
 }
 
 async function main() {
-  writeFileSync(join(AGENT_DIR, "gui.config.json"), JSON.stringify({ mainSession: false }));
+  // The agent profile of this test only (synthetic state; removed at the end). S1-S4 check that the temporary entry is
+  // unchanged next to it; P1-P4 check the agent profile.
+  writeFileSync(join(AGENT_DIR, "gui.config.json"), JSON.stringify({ mainSession: false, workerBrowserProfile: AGENT_PROFILE }));
+  const agentPaths = agentProfilePaths(AGENT_PROFILE);
+  const agentRootExisted = existsSync(agentPaths.root);
+  if (existsSync(agentPaths.config)) throw new Error(`${agentPaths.config} exists already; this test uses a profile of its own`);
   const users = userBrowsers();
   const lock = profileLock();
   handlersBefore = new Set(pids().filter(pid => args(pid)[0]?.endsWith("chrome_crashpad_handler")));
@@ -352,8 +416,81 @@ async function main() {
     evidence.S3 = { removed: l5.dir };
     pass("S3", `desktop ended → browser ${l5.browser.pid}, supervisor ${l5.supervisor} exited; ${l5.dir} (profile included) removed; scope empty; user's Chromium and its profile lock unchanged`);
     worker = undefined as unknown as Agent;
+
+    // ---- P: the agent profile, with a synthetic persistent cookie of a loopback site
+    const site = await cookieSite();
+    try {
+      const agentLaunches = () => launchDirs().filter(dir => record(dir) && (record(dir) as { agentProfile?: string }).agentProfile === AGENT_PROFILE);
+      const capP1 = provider("P1");
+      assert.match(capP1.instructions, new RegExp(`agent browser profile "${AGENT_PROFILE}": ${AGENT_PROFILE_ID.replace(/\./g, "\\.")}`));
+      const p1 = await agent(capP1.extensionFactories, capP1.tools);
+      const rp1 = rec("P1");
+      const beforeP1 = new Set(launchDirs());
+      await p1.run(launchFlow(rp1, AGENT_PROFILE_ID));
+      assert.deepEqual(rp1.errors, [], "agent profile launch errors");
+      const lp1 = await waitLaunch(beforeP1);
+      const isoP = checkIsolation(lp1, users, agentPaths.profile);
+      for (const path of [agentPaths.root, agentPaths.config, agentPaths.profile]) assert.equal(lstatSync(path).mode & 0o777, 0o700, path);
+      await p1.run(visitFlow(rp1, `${site.origin}/set`, /pi-gui-live cookie: set/, "P1-1-set"));
+      assert.deepEqual(rp1.errors, [], "set the test cookie");
+      evidence.P1 = { launch: lp1, ...isoP };
+
+      // ---- P3: one desktop at a time (P1's browser is open)
+      await p1.run(refusedLaunchFlow(rp1, AGENT_PROFILE_ID));
+      assert.match(rp1.texts.at(-1)!, /^refused: .*already open on this desktop/s, rp1.texts.at(-1));
+      const capP2 = provider("P2");
+      const p2 = await agent(capP2.extensionFactories, capP2.tools);
+      const rp2 = rec("P2");
+      await p2.run(refusedLaunchFlow(rp2, AGENT_PROFILE_ID));
+      assert.match(rp2.texts.at(-1)!, /^refused: .*already open on worker P1's private desktop/s, rp2.texts.at(-1));
+      assert.deepEqual(agentLaunches(), [lp1.dir], "no second launch of the profile");
+      evidence.P3 = { sameDesktop: rp1.texts.at(-1), otherDesktop: rp2.texts.at(-1) };
+      pass("P3", `while P1's agent browser ${lp1.browser.pid} runs: P1's second launch refused ("already open on this desktop"), P2's launch refused naming worker P1; one launch of the profile`);
+
+      // ---- P1: the browser closes and starts again on the same desktop: the cookie is kept
+      await p1.run(closeFlow(rp1));
+      await until("the agent browser exits after Ctrl+Shift+W", () => !live(lp1.browser.pid, lp1.browser.start) && !live(lp1.supervisor));
+      await until("its launch directory is removed", () => !existsSync(lp1.dir), 10_000);
+      assert.deepEqual(scopeProcs(lp1.scope), []);
+      assert.ok(existsSync(join(agentPaths.profile, "Default")), "the agent profile is kept");
+      const rp1b = rec("P1b");
+      const beforeP1b = new Set(launchDirs());
+      await p1.run(launchFlow(rp1b, AGENT_PROFILE_ID));
+      const lp1b = await waitLaunch(beforeP1b);
+      await p1.run(visitFlow(rp1b, `${site.origin}/check`, /pi-gui-live cookie: (present|absent)/, "P1-2-check"));
+      assert.match(rp1b.texts.at(-1)!, /pi-gui-live cookie: present/, "the cookie survives a browser restart");
+      assert.deepEqual(rp1b.errors, []);
+      pass("P1", `agent browser ${lp1.browser.pid} with --user-data-dir=${agentPaths.profile} set a test cookie; closed (launch dir ${lp1.dir} removed, profile kept); restarted on the same desktop as ${lp1b.browser.pid}: cookie present; ${[...rp1.shots, ...rp1b.shots].join(", ")}`);
+
+      // ---- P4: P1's desktop ends; P2's (another, new) desktop gets the profile and the cookie
+      const p1Runtime = (record(lp1b.dir) as unknown as { runtime: string }).runtime;
+      await end(p1.session);
+      await until("the agent browser and supervisor exit when the desktop ends", () => !live(lp1b.browser.pid, lp1b.browser.start) && !live(lp1b.supervisor), 30_000);
+      await until("its launch directory is removed", () => !existsSync(lp1b.dir), 10_000);
+      assert.ok(existsSync(join(agentPaths.profile, "Default")), "the agent profile survives the desktop");
+      const rp2b = rec("P2b");
+      const beforeP2 = new Set(launchDirs());
+      await p2.run(launchFlow(rp2b, AGENT_PROFILE_ID));
+      const lp2 = await waitLaunch(beforeP2);
+      assert.notEqual((record(lp2.dir) as unknown as { runtime: string }).runtime, p1Runtime, "another desktop");
+      await p2.run(visitFlow(rp2b, `${site.origin}/check`, /pi-gui-live cookie: (present|absent)/, "P2-check"));
+      assert.match(rp2b.texts.at(-1)!, /pi-gui-live cookie: present/, "the cookie survives the desktop's end and reaches a new desktop");
+      await end(p2.session);
+      await until("P2's agent browser and supervisor exit with its desktop", () => !live(lp2.browser.pid, lp2.browser.start) && !live(lp2.supervisor), 30_000);
+      await until("its launch directory is removed", () => !existsSync(lp2.dir), 10_000);
+      assert.deepEqual(supervisors(), [], "no supervisor outlives its desktop");
+      assert.ok(!readFileSync("/proc/net/unix", "utf8").includes(`@pi-gui-agent-profile/${uid}/${AGENT_PROFILE}`), "the profile's lock is released");
+      assert.deepEqual(userBrowsers(), users);
+      assert.equal(profileLock(), lock);
+      evidence.P4 = { first: lp1b, next: lp2, screenshots: rp2b.shots };
+      pass("P4", `P1's desktop ended (browser ${lp1b.browser.pid} stopped, ${lp1b.dir} removed, profile kept); P2's desktop launched it as ${lp2.browser.pid}: cookie present; P2 ended: no supervisor, lock released; user's Chromium and its profile lock unchanged`);
+    } finally {
+      site.close();
+    }
   } finally {
     await end(main.session).catch(() => undefined);
+    rmSync(agentPaths.config, { recursive: true, force: true });
+    if (!agentRootExisted) rmSync(agentPaths.root, { recursive: true, force: true });
     writeFileSync(join(OUT, "evidence.json"), `${JSON.stringify({ evidence, passed }, null, 2)}\n`);
   }
   console.log(`\n${passed.join("\n")}\nevidence: ${join(OUT, "evidence.json")}`);

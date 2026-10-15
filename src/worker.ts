@@ -99,7 +99,11 @@ export interface WorkerWeb {
   browsers: string[];
   /** The user allowed browsers with their own profile (gui.config.json allowWorkerUserBrowserProfiles). */
   userProfiles: boolean;
+  /** The user's agent profile (gui.config.json workerBrowserProfile), offered here as {@link AGENT_PROFILE_ENTRY}. */
+  agentProfile?: string;
 }
+
+const AGENT_PROFILE_ENTRY = "pi-gui-chromium-agent-profile.desktop";
 
 export function workerInstructions(mode: ToolMode, options: { readOnly?: boolean; web?: WorkerWeb } = {}): string {
   const [first, second] = toolNames(mode);
@@ -109,6 +113,9 @@ export function workerInstructions(mode: ToolMode, options: { readOnly?: boolean
     : web.browsers.length
       ? [`Web browsers: launch only ${web.browsers.join(", ")}. It starts signed out with a fresh or temporary profile of its own (not the user's), deleted when it closes or with this desktop; other browser entries (the snap's own Chromium and Firefox entries included) are refused because they would open the user's own profile, cookies and logins.`]
       : ["Web browsers: none can run here with a disposable profile (Chromium-family browsers installed outside snap/Flatpak can, and the installed snap Chromium through pi-gui's temporary-profile entry when /gui status offers it), and other browser entries are refused because they would open the user's own profile. If the task needs a rendered page, report that, instead of working around it."];
+  const agentLine = !web?.agentProfile ? [] : [
+    `The user also set up an agent browser profile "${web.agentProfile}": ${AGENT_PROFILE_ENTRY} opens the same snap Chromium with a persistent profile that the user's GUI workers share (not the user's own browser profile). Its sign-ins and cookies are kept across browser restarts and desktops, so it may already be signed in to accounts: use it only when the task needs those saved sign-ins, and act only as the assignment says. A sign-in the user completes in it (through /gui view, as above) stays for later workers. It can be open on one desktop at a time: launch it once and use its window (new tab: Ctrl+T); when you are done with it, close its window (Ctrl+Shift+W) so other workers can use it. Links that apps open never use it (they open signed out).`,
+  ];
   const readOnly = options.readOnly !== false;
   const readOnlyLine = !readOnly ? [] : [
     `Your role is read-only, so this desktop is observe-only: ${[...OBSERVE_OPERATIONS].join(", ")}. act (clicks, typing, paste, form input) is refused before it runs. When the task needs input in an app (navigating a page, submitting, uploading, signing in), stop and report that it needs a worker with a writing role (orche_task role implement with gui: true, delegated by the main session). Read public web pages with browser_fetch.`,
@@ -124,6 +131,7 @@ export function workerInstructions(mode: ToolMode, options: { readOnly?: boolean
     "Apps there run as the user with the user's files and network: stay within the assignment, and report GUI evidence (what you observed) in your result.",
     "When a step needs the user (a sign-in, 2FA code, CAPTCHA or consent screen), do not guess credentials or work around it: leave the app on that screen and end the assignment, reporting that user sign-in is needed on this desktop. The user can open it with /gui view and then reuse you with the same desktop.",
     ...browserLine,
+    ...agentLine,
     ...readOnlyLine,
   ].join("\n");
 }

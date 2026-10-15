@@ -190,3 +190,21 @@ test("config: allowWorkerUserBrowserProfiles is off by default and only the user
   assert.throws(() => validateGuiConfig({ allowWorkerUserBrowserProfiles: true }, { project: true }), /only allowed in the user config/);
   assert.throws(() => validateGuiConfig({ allowWorkerUserBrowserProfiles: "yes" }), /must be a boolean/);
 });
+
+test("config: workerBrowserProfile (persistent agent profile) is off by default, user config only, a plain name", async () => {
+  assert.equal(DEFAULT_GUI_CONFIG.workerBrowserProfile, null);
+  assert.deepEqual(validateGuiConfig({ workerBrowserProfile: "agent" }), { workerBrowserProfile: "agent" });
+  assert.deepEqual(validateGuiConfig({ workerBrowserProfile: null }), { workerBrowserProfile: null });
+  assert.throws(() => validateGuiConfig({ workerBrowserProfile: "agent" }, { project: true }), /"workerBrowserProfile" is only allowed in the user config/);
+  for (const bad of ["", "../chromium", "a/b", "-x", ".x", "has space", "x".repeat(65), true, 1]) {
+    assert.throws(() => validateGuiConfig({ workerBrowserProfile: bad }), /workerBrowserProfile must be null or a name/, String(bad));
+  }
+  // A trusted project cannot turn it on for its workers.
+  const root = await mkdtemp(join(tmpdir(), "pi-gui-config-"));
+  await mkdir(join(root, "project", ".pi"), { recursive: true });
+  await mkdir(join(root, "agent"), { recursive: true });
+  await writeFile(join(root, "project", ".pi", "gui.config.json"), JSON.stringify({ workerBrowserProfile: "agent" }));
+  const loaded = await loadGuiConfig({ cwd: join(root, "project"), agentDir: join(root, "agent"), projectTrusted: true });
+  assert.equal(loaded.config.workerBrowserProfile, null);
+  assert.match(loaded.errors[0]!, /only allowed in the user config/);
+});

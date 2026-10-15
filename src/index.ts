@@ -16,8 +16,9 @@ import {
   CAPABILITY_CHANNEL, GUI_CAPABILITY, guiSessionExtension, isCapabilityRequest, workerInstructions, workerMcpExtension,
 } from "./worker.ts";
 import {
-  browserEnv, checkWorkerLaunch, listBrowsers, SNAP_CHROMIUM_ID, SNAP_CHROMIUM_SUPERVISOR, snapChromiumShimFits, snapChromiumStatus, snapDesktopsDir, webDefaultsEnv,
+  AGENT_PROFILE_ID, agentProfileBusy, browserEnv, checkWorkerLaunch, listBrowsers, SNAP_CHROMIUM_ID, SNAP_CHROMIUM_SUPERVISOR, snapChromiumShimFits, snapChromiumStatus, snapDesktopsDir, webDefaultsEnv,
 } from "./browsers.ts";
+import { agentProfilePaths, agentProfileUse } from "../bin/pi-gui-snap-chromium.mjs";
 import {
   checkViewerPrerequisites, connectionMessage, findPrivateSession, newViewTag, probeRdpClients, startViewer, VIEW_HOST, ViewRegistry, withViewTag,
   type PrivateSession, type RunningViewer, type SessionLookup,
@@ -245,18 +246,24 @@ export function createGuiExtension(options: GuiExtensionOptions = {}) {
       const appEnv = { ...process.env, ...config.env };
       const apps = browserEnv(appEnv);
       const browsers = listBrowsers(apps);
-      // The installed snap Chromium only through pi-gui's entry: temporary profile, supervised (browsers.ts).
+      // The installed snap Chromium only through pi-gui's entries: temporary profile, supervised (browsers.ts); and, with
+      // the user's workerBrowserProfile, the agent profile for writing roles (read-only roles never see its sign-ins).
       const snap = userProfiles ? undefined : snapStatus();
       const snapChromium = snap?.ok === true;
+      const agentProfile = snapChromium && !readOnly ? config.workerBrowserProfile : null;
       const web = {
         browsers: [...browsers.filter(verdict => userProfiles || verdict.disposable).map(verdict => verdict.entry.id), ...(snapChromium ? [SNAP_CHROMIUM_ID] : [])],
         userProfiles,
+        ...(agentProfile ? { agentProfile } : {}),
       };
-      const checkLaunch = userProfiles ? undefined : (desktopId: string) => checkWorkerLaunch(desktopId, apps, { snapChromium });
+      const agentCheck = agentProfile && snap?.ok
+        ? () => agentProfileBusy(agentProfile, agentProfileUse(agentProfile, { snapDir: join(snap.userRuntime, "snap.chromium") }), tag, other => views.list().find(target => target.tag === other)?.name)
+        : undefined;
+      const checkLaunch = userProfiles ? undefined : (desktopId: string) => checkWorkerLaunch(desktopId, apps, { snapChromium, ...(agentCheck ? { agentProfile: agentCheck } : {}) });
       let server = baseServer;
       if (!userProfiles) {
         try {
-          const snapLaunch = snapChromium ? { node: process.execPath, supervisor: SNAP_CHROMIUM_SUPERVISOR, log: join(agentDir, "gui-snap-chromium.log") } : undefined;
+          const snapLaunch = snapChromium ? { node: process.execPath, supervisor: SNAP_CHROMIUM_SUPERVISOR, log: join(agentDir, "gui-snap-chromium.log"), ...(agentProfile ? { agentProfile } : {}) } : undefined;
           // The snap may connect only to sockets bound under /run/user/<uid>/snap.chromium, so the runner's private
           // runtime dir (mktemp in TMPDIR) goes there.
           const desktops = snapChromium && snap?.ok ? snapDesktopsDir(snap.userRuntime) : undefined;
@@ -288,12 +295,17 @@ export function createGuiExtension(options: GuiExtensionOptions = {}) {
     const workerBrowsersLine = (config: GuiConfig): string => {
       const appEnv = { ...process.env, ...config.env };
       const verdicts = listBrowsers(browserEnv(appEnv));
-      if (config.allowWorkerUserBrowserProfiles) return `Worker browsers: any (allowWorkerUserBrowserProfiles: the user's own profiles allowed): ${verdicts.map(verdict => verdict.entry.id).join(", ") || "none found"}`;
-      const snap = snapStatus();
-      const usable = [...verdicts.filter(verdict => verdict.disposable).map(verdict => verdict.entry.id), ...(snap.ok ? [`${SNAP_CHROMIUM_ID} (snap Chromium, temporary profile)`] : [])];
+      const name = config.workerBrowserProfile;
+      const snap = config.allowWorkerUserBrowserProfiles ? undefined : snapStatus();
+      const agentLine = !name ? ""
+        : `\nAgent browser profile "${name}" (workerBrowserProfile, sign-ins kept in ${agentProfilePaths(name).profile}): ${
+          config.allowWorkerUserBrowserProfiles ? "not offered while allowWorkerUserBrowserProfiles is on"
+          : snap?.ok ? `${AGENT_PROFILE_ID} for writing-role workers, one desktop at a time` : `not offered (snap Chromium is not: ${snap?.reason})`}`;
+      if (config.allowWorkerUserBrowserProfiles) return `Worker browsers: any (allowWorkerUserBrowserProfiles: the user's own profiles allowed): ${verdicts.map(verdict => verdict.entry.id).join(", ") || "none found"}${agentLine}`;
+      const usable = [...verdicts.filter(verdict => verdict.disposable).map(verdict => verdict.entry.id), ...(snap?.ok ? [`${SNAP_CHROMIUM_ID} (snap Chromium, temporary profile)`] : [])];
       const refused = verdicts.flatMap(verdict => verdict.disposable ? [] : [`${verdict.entry.id} (${verdict.reason})`]);
-      const snapLine = snap.ok ? "" : `; snap Chromium with a temporary profile not offered: ${snap.reason}`;
-      return `Worker browsers (disposable profile): ${usable.join(", ") || "none — install a Chromium-family browser outside snap/Flatpak, e.g. Google Chrome"}${snapLine}${refused.length ? `; refused: ${refused.join("; ")}` : ""}`;
+      const snapLine = snap?.ok ? "" : `; snap Chromium with a temporary profile not offered: ${snap?.reason}`;
+      return `Worker browsers (disposable profile): ${usable.join(", ") || "none — install a Chromium-family browser outside snap/Flatpak, e.g. Google Chrome"}${snapLine}${refused.length ? `; refused: ${refused.join("; ")}` : ""}${agentLine}`;
     };
     const statusReport = (): string => {
       const { config } = loaded;

@@ -177,6 +177,9 @@ logins. Without the user's `allowWorkerUserBrowserProfiles`, the following appli
   snap's confinement, with a profile pi-gui creates for each launch and removes afterwards, under a pi-gui supervisor.
   The snap's own entries (`chromium_chromium.desktop`, its actions, `chromium-browser.desktop`) stay refused, and the
   refusal points to pi-gui's entry.
+- **Allowed only with the user's opt-in `workerBrowserProfile`, for writing roles: `pi-gui-chromium-agent-profile.desktop`**,
+  the same snap Chromium with a persistent agent-only profile whose sign-ins survive browser restarts and desktops (see
+  [Agent browser profile](#agent-browser-profile-opt-in-persistent-sign-ins)). It never handles links.
 - **Refused, with the reason:**
   - Browsers that would use the user's profile: snaps (`~/snap/<name>`, including Ubuntu's `/usr/bin/firefox` and
     `/usr/bin/chromium-browser` wrappers), Flatpaks (`~/.var/app`), Firefox and other browsers with profiles under `$HOME`.
@@ -196,7 +199,8 @@ logins. Without the user's `allowWorkerUserBrowserProfiles`, the following appli
 - The worker's instructions name the allowed browser entries, or say that there is none and that one must be installed
   (on Ubuntu, for example Google Chrome's `.deb`). `/gui status` shows the same (`Worker browsers …`).
 - **Sign-in** stays with the user: the worker leaves the sign-in screen open and reports it; the user signs in through
-  `/gui view` on that worker's desktop and reuses the worker.
+  `/gui view` on that worker's desktop and reuses the worker. A sign-in in the temporary profile is gone with that
+  browser; to keep it for later workers, use the opt-in [agent browser profile](#agent-browser-profile-opt-in-persistent-sign-ins).
 - `allowWorkerUserBrowserProfiles: true` (user config only) lifts the browser, launcher and link checks for workers; their
   instructions then say that a browser may be signed in as the user. The role boundary stays.
 
@@ -293,10 +297,98 @@ Chromium itself replaces any `--user-data-dir` it cannot create with the default
   Chromium starts; that is deliberate tampering by something with that access already, not a fallback of pi-gui's.
   KIO's link handling was not checked on a live desktop.
 
+### Agent browser profile (opt-in, persistent sign-ins)
+
+By default every launch of `pi-gui-chromium-temp-profile.desktop` starts with an empty profile that is removed when the
+browser closes or its desktop ends, so a sign-in never reaches the next browser or worker. If you want workers to stay
+signed in, you can give them **one agent-only profile of their own** that survives browser restarts and desktops. It is
+off by default and only you can turn it on.
+
+**Turn it on** (this changes your user configuration; pi-gui never writes it):
+
+1. Add the key to `~/.pi/agent/gui.config.json` (create the file if needed). A trusted project's `.pi/gui.config.json` may
+   not set it (the file is then rejected).
+
+   ```json
+   { "workerBrowserProfile": "agent" }
+   ```
+
+   The name: letters, digits, `_` and `-`, starting with a letter or digit, at most 64 characters.
+2. `/reload` (or start Pi again). `/gui status` then shows `Agent browser profile "agent" (…): pi-gui-chromium-agent-profile.desktop
+   for writing-role workers`, or why it is not offered.
+3. Sign in once: give a GUI worker with a writing role a task (`orche_task` role `implement`, `gui: true`) that opens
+   `pi-gui-chromium-agent-profile.desktop`. When it stops at the sign-in screen, `/gui view W1`, sign in, `/gui view
+   stop W1` (see [Viewing a private desktop yourself](#viewing-a-private-desktop-yourself-gui-view)). Later workers,
+   on new desktops, find the sign-in. The worker's instructions name the entry and these rules.
+
+**What it is.** The same snap Chromium, launch checks and supervisor as the temporary entry, except that Chromium's
+profile (`--user-data-dir` and its default profile, `CHROME_CONFIG_HOME`) is
+`~/snap/chromium/common/pi-gui-profiles/<name>/chromium`: the snap's per-user common directory, kept across snap
+refreshes, next to (never inside) your own `~/snap/chromium/common/chromium`. pi-gui creates it 0700 on the first
+launch and refuses to start (before the snap runs) when a directory of that path is a link, not yours, or readable by
+others; the in-snap script checks the same path again inside the confinement (exactly
+`$SNAP_USER_COMMON/pi-gui-profiles/<name>`, real directories of this user, canonical) and exits before Chromium
+starts otherwise. Everything else of a launch (`HOME` with the NSS store, `XDG_CACHE_HOME`, temporary files, the
+singleton socket, crash dumps, `owner.json`) is still the per-launch directory in `/run/user/<uid>/snap.chromium`,
+removed as before; pi-gui never removes or cleans the agent profile itself. Session-only cookies are not kept across
+browser restarts (Chromium's normal behaviour); persistent cookies, local storage and saved passwords are.
+
+**Who gets it.** Only workers of writing roles (implement, game-asset, video), and only while snap Chromium is offered
+and `allowWorkerUserBrowserProfiles` is off. Read-only roles and the main session never get the entry. The temporary
+entry stays available next to it, and **links stay with the temporary profile**: the agent entry has no MIME types and
+is never the desktop's link handler or `$BROWSER`, so an app opening a link never lands in a signed-in browser.
+Changing `workerBrowserProfile` changes the capability key, so a reused worker gets a fresh desktop.
+
+**One desktop at a time.** Chromium allows one browser per profile; a second start hands its URL to the running one,
+which would be on another worker's desktop. So:
+
+- The supervisor holds an abstract Unix socket `@pi-gui-agent-profile/<uid>/<name>` for its whole life (the kernel
+  releases it when the supervisor exits or is killed) and records the profile, its desktop's display and view tag in
+  the launch's `owner.json`.
+- A launch is refused while the profile is in use: the lock is held, a launch record of the profile still has a live
+  supervisor, launcher, browser or scope process, or a browser process still runs with the profile (for example after
+  its supervisor was killed). The worker's `launch_application` gets the refusal before anything reaches its desktop:
+  on its own desktop "use that window" (new tab: Ctrl+T), on another desktop which worker has it (or that it belongs to
+  another Pi session), with what to do (wait for it to close or that desktop to end, report it, or use the temporary
+  entry). The supervisor checks again atomically (lock first) and logs a refusal to `~/.pi/agent/gui-snap-chromium.log`.
+- Repeated use on one desktop keeps the state: the profile stays open in its browser, and a later launch (same or
+  another desktop) starts with what the previous browser saved. Closing the browser (Ctrl+Shift+W on its last window) or
+  ending the desktop stops it gracefully (TERM), so Chromium writes its cookies before the profile is released.
+- Recovery needs no manual step: a killed supervisor's lock goes with it; its record keeps the profile busy only while
+  something of that launch still runs, and the next launch removes the stale launch directory (not the profile).
+  Chromium itself takes over its own stale `SingletonLock` in the profile; pi-gui never deletes it.
+
+**Security.** Read this before you sign in:
+
+- **Anyone who can use this profile acts as the signed-in accounts.** Every writing-role GUI worker you start (of any
+  Pi session of this user) can open it; a prompt-injected page or task can make an agent use those accounts. Use a
+  dedicated account with the least rights it needs, not your personal account, and prefer services where you can see
+  and revoke sessions.
+- **The files are not protected by a keyring.** The browser runs with `--password-store=basic`: Chromium encrypts cookies
+  and saved passwords with a fixed key, not your desktop keyring, so whoever can read
+  `~/snap/chromium/common/pi-gui-profiles/<name>` can use the sessions. That is every process of your user: any Pi
+  agent's `bash` tool (read-only roles included: the role boundary is for the GUI only and is not an OS security
+  boundary), other programs you run, and the snap's AppArmor label, which your own snap Chromium shares. Backups of
+  your home copy it too.
+- `snap remove chromium` deletes `~/snap/chromium` with the profile, but snapd first saves an automatic snapshot of the
+  snap's user data (this profile included); `snap saved` lists it and `snap forget <set-id>` deletes it.
+- pi-gui's logs name only paths, the profile name, PIDs and displays; never cookies, page content or typed text. The
+  tests use synthetic state only.
+
+**Reset or remove.**
+
+1. Make sure no browser uses it: let GUI workers finish (or end them, e.g. `/orche stop`); `pgrep -af
+   'pi-gui-profiles/<name>/'` must print nothing.
+2. Sign everything out by deleting the profile: `rm -rf ~/snap/chromium/common/pi-gui-profiles/<name>`. The next launch
+   creates an empty one. (Signing out of a service inside the browser works too.) If you think the profile leaked,
+   also end its sessions on the service's side (password change, "sign out of all sessions").
+3. Turn the feature off: remove `workerBrowserProfile` from `~/.pi/agent/gui.config.json` (or set it to `null`) and
+   `/reload`. Turning it off does not delete the profile: do step 2 as well.
+
 ## Configuration
 
 `~/.pi/agent/gui.config.json`, optionally overridden key by key by a trusted project's `.pi/gui.config.json` (which may not
-set `allowPhysicalDesktop`, `allowWorkerUserBrowserProfiles`, `command`, `args` or `env`). Unknown keys or wrong types reject the whole file with a warning.
+set `allowPhysicalDesktop`, `allowWorkerUserBrowserProfiles`, `workerBrowserProfile`, `command`, `args`, `env` or `viewerCommand`). Unknown keys or wrong types reject the whole file with a warning.
 
 ```json
 {
@@ -309,6 +401,7 @@ set `allowPhysicalDesktop`, `allowWorkerUserBrowserProfiles`, `command`, `args` 
   "exposure": "direct",
   "allowPhysicalDesktop": false,
   "allowWorkerUserBrowserProfiles": false,
+  "workerBrowserProfile": null,
   "timeoutSeconds": 150,
   "env": {}
 }
@@ -325,6 +418,7 @@ set `allowPhysicalDesktop`, `allowWorkerUserBrowserProfiles`, `command`, `args` 
 | `exposure` | `"direct"` | Pi exposure in the main session (`direct`, `deferred`, `codemode`). Workers always use `direct`. |
 | `allowPhysicalDesktop` | `false` | See above. |
 | `allowWorkerUserBrowserProfiles` | `false` | Workers may also launch browsers that use the user's own profile. See [Workers and web browsers](#workers-and-web-browsers). |
+| `workerBrowserProfile` | `null` | User config only. A name: writing-role workers may also launch `pi-gui-chromium-agent-profile.desktop`, snap Chromium with that persistent agent-only profile (sign-ins kept across browsers and desktops, one desktop at a time). See [Agent browser profile](#agent-browser-profile-opt-in-persistent-sign-ins). |
 | `timeoutSeconds` | `150` | Pi's MCP request timeout. The first call of a session starts the private desktop (upstream allows 120 s). |
 | `env` | `{}` | Extra server environment (e.g. `RUST_LOG`). Physical-session variables are still removed. |
 
@@ -415,9 +509,15 @@ connected to the physical session's Wayland, buses, PipeWire/PulseAudio or X11 o
 `~/snap/chromium/common/chromium`, that crash databases are the launch's own, and that the user's Chromium keeps its
 PID, start time and profile lock. S2 closes the window (Ctrl+Shift+W); S4 SIGKILLs the supervisor and the scope, and the
 next launch removes the left launch directory; S3 ends the worker session (the desktop). After each: no process of the
-scope and no launch directory left. The fail-closed start (no browser start at all when the launch's profile cannot be
-created or kept, never the user's profile) is covered by `test/snap-chromium.test.ts`, including the script inside the
-real snap's confinement.
+scope and no launch directory left. With `workerBrowserProfile` set to a test profile of its own (`pi-gui-live-test`,
+removed at the end) it then checks the agent profile against a synthetic loopback site that sets an expiring random
+cookie (never shown or saved; pages say only `cookie: present|absent`): P1 sets it, closes the browser (launch directory
+removed, profile kept) and finds it again after a restart on the same desktop; P3, while that browser runs, has a second
+launch on the same desktop refused ("already open on this desktop") and one from another worker refused naming the
+holder; P4 ends the first desktop and finds the cookie from another worker's new desktop, then checks that no
+supervisor or lock is left. The fail-closed start (no browser start at all when the launch's profile cannot be
+created or kept, never the user's profile), the agent profile's lock, killed-supervisor and link cases are covered by
+`test/snap-chromium.test.ts`, including the script inside the real snap's confinement.
 
 Screenshots go to `$TMPDIR/pi-gui-live/`.
 

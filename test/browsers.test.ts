@@ -6,7 +6,7 @@ import { existsSync, mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
-  checkWorkerLaunch, classifyLaunch, execProgram, isBrowserEntry, listBrowsers, NO_BROWSER_ID, SNAP_CHROMIUM_ID, SNAP_CHROMIUM_SUPERVISOR,
+  AGENT_PROFILE_ID, agentProfileBusy, checkWorkerLaunch, classifyLaunch, execProgram, isBrowserEntry, listBrowsers, NO_BROWSER_ID, SNAP_CHROMIUM_ID, SNAP_CHROMIUM_SUPERVISOR,
   snapChromiumEntry, snapChromiumShim, webDefaultsEnv, webDefaultsFiles,
   type BrowserEnv, type BrowserFs, type BrowserVerdict,
 } from "../src/browsers.ts";
@@ -205,7 +205,7 @@ test("snap Chromium: only pi-gui's temporary-profile entry, when offered; the sn
   assert.match(checkWorkerLaunch("firefox_firefox.desktop", snapEnv, { snapChromium: true })!, /is a snap/, "other snaps stay refused");
   // Entry and shim: one program for launches, links and $BROWSER.
   const launch = { node: "/usr/bin/node", supervisor: SNAP_CHROMIUM_SUPERVISOR, log: "/a/gui-snap-chromium.log" };
-  assert.equal(snapChromiumShim(launch), `#!/bin/sh\n# Written by pi-gui: snap Chromium with a temporary profile on a worker's private desktop.\nPI_GUI_SNAP_CHROMIUM_LOG='/a/gui-snap-chromium.log' exec '/usr/bin/node' '${SNAP_CHROMIUM_SUPERVISOR}' "$@"\n`);
+  assert.equal(snapChromiumShim(launch), `#!/bin/sh\n# Written by pi-gui: snap Chromium with a temporary profile on a worker's private desktop.\nPI_GUI_SNAP_CHROMIUM_PROFILE='' PI_GUI_SNAP_CHROMIUM_LOG='/a/gui-snap-chromium.log' exec '/usr/bin/node' '${SNAP_CHROMIUM_SUPERVISOR}' "$@"\n`, "the temporary entry clears any inherited agent profile");
   assert.match(snapChromiumShim({ ...launch, log: "/it's/log" }), /PI_GUI_SNAP_CHROMIUM_LOG='\/it'\\''s\/log'/);
   assert.match(snapChromiumEntry("/x/shim"), /^Exec=\/x\/shim %U$/m);
   assert.throws(() => snapChromiumEntry("/x/a b/shim"), /needs quoting/, "xdg-mime would skip a quoted program");
@@ -223,11 +223,36 @@ test("snap Chromium: only pi-gui's temporary-profile entry, when offered; the sn
   assert.ok(withChrome.snapChromium);
 });
 
+test("agent profile entry: offered only when given, never a link handler; busy refusals name the holder and what to do", () => {
+  const snapEnv = memoryEnv(files);
+  // Not offered (no workerBrowserProfile, read-only role or no snap Chromium): refused with the reason.
+  for (const id of [AGENT_PROFILE_ID, "pi-gui-chromium-agent-profile"]) {
+    assert.match(checkWorkerLaunch(id, snapEnv, { snapChromium: true })!, /agent browser profile is not offered here.*workerBrowserProfile/, id);
+    assert.equal(checkWorkerLaunch(id, snapEnv, { snapChromium: true, agentProfile: () => undefined }), undefined, id);
+    assert.equal(checkWorkerLaunch(id, snapEnv, { snapChromium: true, agentProfile: () => "busy" }), "busy", id);
+  }
+  assert.equal(checkWorkerLaunch(SNAP_CHROMIUM_ID, snapEnv, { snapChromium: true, agentProfile: () => "busy" }), undefined, "the temporary entry is not affected");
+  const launch = { node: "/usr/bin/node", supervisor: SNAP_CHROMIUM_SUPERVISOR, log: "/a/log" };
+  assert.match(snapChromiumShim(launch, "work"), /^PI_GUI_SNAP_CHROMIUM_PROFILE='work' PI_GUI_SNAP_CHROMIUM_LOG='\/a\/log' exec /m);
+  const entryText = snapChromiumEntry("/x/agent", "work");
+  assert.match(entryText, /^Exec=\/x\/agent %U$/m);
+  assert.doesNotMatch(entryText, /MimeType/, "links never open in the agent profile");
+  // Busy: on this desktop (its own tag), on another worker's, elsewhere, a left browser, a lock being taken.
+  const owner = (tag?: string) => ({ owner: { pid: 1, runtime: "/r", profile: "/p", agentProfile: "work", display: "wayland-virtual-7", ...(tag ? { tag } : {}) }, dir: "/d" });
+  assert.equal(agentProfileBusy("work", undefined, "t1"), undefined);
+  assert.match(agentProfileBusy("work", owner("t1"), "t1")!, /already open on this desktop .*Use that window: list_desktop/);
+  const other = agentProfileBusy("work", owner("t2"), "t1", tag => tag === "t2" ? "W3" : undefined)!;
+  assert.match(other, /already open on worker W3's private desktop\. A profile can be open on one desktop at a time.*Wait until.*pi-gui-chromium-temp-profile\.desktop \(signed out\)/);
+  assert.match(agentProfileBusy("work", owner("t9"), "t1")!, /another private desktop \(wayland-virtual-7, not a worker of this Pi session\)/);
+  assert.match(agentProfileBusy("work", { pid: 42 }, "t1")!, /browser process \(42\)/);
+  assert.match(agentProfileBusy("work", { lock: true }, "t1")!, /a launch with it is starting/);
+});
+
 test("snap Chromium web defaults: GIO and xdg-mime resolve links to pi-gui's entry; $BROWSER is its shim", { skip: !gioAvailable && "gio/xdg-mime not installed" }, () => {
   const scratch = mkdtempSync(join(tmpdir(), "pi-gui-snapweb-"));
   const hostEnv = { ...process.env, XDG_DATA_DIRS: process.env.XDG_DATA_DIRS || "/usr/local/share:/usr/share" };
   const browsers = listBrowsers({ dataDirs: hostEnv.XDG_DATA_DIRS.split(":"), path: (process.env.PATH ?? "").split(":") }).filter(verdict => !verdict.disposable);
-  const pinned = webDefaultsEnv(join(scratch, "root"), browsers, hostEnv, { node: process.execPath, supervisor: SNAP_CHROMIUM_SUPERVISOR, log: join(scratch, "log") });
+  const pinned = webDefaultsEnv(join(scratch, "root"), browsers, hostEnv, { node: process.execPath, supervisor: SNAP_CHROMIUM_SUPERVISOR, log: join(scratch, "log"), agentProfile: "work" });
   const sessionEnv = { ...hostEnv, ...pinned, XDG_CONFIG_HOME: join(scratch, "config"), XDG_DATA_HOME: join(scratch, "data"), XDG_CURRENT_DESKTOP: "KDE" };
   for (const type of ["x-scheme-handler/https", "x-scheme-handler/http", "text/html"]) {
     const gio = execFileSync("gio", ["mime", type], { env: sessionEnv, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
@@ -238,4 +263,9 @@ test("snap Chromium web defaults: GIO and xdg-mime resolve links to pi-gui's ent
   const shim = pinned.BROWSER!;
   assert.ok(existsSync(shim) && readFileSync(shim, "utf8").includes(SNAP_CHROMIUM_SUPERVISOR), shim);
   assert.match(readFileSync(join(pinned.XDG_DATA_DIRS!.split(":")[0]!, "applications", SNAP_CHROMIUM_ID), "utf8"), new RegExp(`^Exec=${shim.replace(/[.]/g, "\\.")} %U$`, "m"));
+  // The agent-profile entry is launchable (its own shim names the profile) but handles no link: links stay signed out.
+  const agentEntry = readFileSync(join(pinned.XDG_DATA_DIRS!.split(":")[0]!, "applications", AGENT_PROFILE_ID), "utf8");
+  const agentShim = /^Exec=(\S+) %U$/m.exec(agentEntry)?.[1];
+  assert.ok(agentShim && agentShim !== shim && readFileSync(agentShim, "utf8").includes("PI_GUI_SNAP_CHROMIUM_PROFILE='work'"), agentEntry);
+  assert.ok(readFileSync(shim, "utf8").includes("PI_GUI_SNAP_CHROMIUM_PROFILE=''"));
 });

@@ -11,7 +11,7 @@ import { createInterface } from "node:readline";
 
 const [command, ...rest] = process.argv.slice(2);
 const SESSION = `session-${(process.pid % 0xffff).toString(16).padStart(16, "0")}`;
-const visible = ["WAYLAND_DISPLAY", "DISPLAY", "DBUS_SESSION_BUS_ADDRESS", "AT_SPI_BUS_ADDRESS", "XDG_RUNTIME_DIR", "PI_GUI_TEST_MARK", "BROWSER", "XDG_CONFIG_DIRS", "XDG_DATA_DIRS", "TMPDIR"];
+const visible = ["WAYLAND_DISPLAY", "DISPLAY", "DBUS_SESSION_BUS_ADDRESS", "AT_SPI_BUS_ADDRESS", "XDG_RUNTIME_DIR", "PI_GUI_TEST_MARK", "BROWSER", "XDG_CONFIG_DIRS", "XDG_DATA_DIRS", "TMPDIR", "PI_GUI_VIEW_TAG"];
 const env = Object.fromEntries(visible.map(name => [name, process.env[name] ?? null]));
 
 // The first background call starts a stand-in for upstream's private session, as the runner lays it out: a 0700

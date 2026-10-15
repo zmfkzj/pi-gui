@@ -9,7 +9,7 @@ printf 'call %s\n' "$$" >> "$FAKE_SNAP_CALLS"
 script=$5; shift 5
 launch_dir=$3
 export SNAP="$FAKE_SNAP_ROOT" SNAP_REVISION="${FAKE_SNAP_REVISION:-1}" SNAP_INSTANCE_NAME=chromium
-export CHROME_CONFIG_HOME="$FAKE_USER_COMMON" HOME="$FAKE_SNAP_USER_DATA" XDG_CACHE_HOME="$FAKE_USER_COMMON/.cache" TMPDIR="$FAKE_TMP"
+export SNAP_USER_COMMON="$FAKE_USER_COMMON" CHROME_CONFIG_HOME="$FAKE_USER_COMMON" HOME="$FAKE_SNAP_USER_DATA" XDG_CACHE_HOME="$FAKE_USER_COMMON/.cache" TMPDIR="$FAKE_TMP"
 if [ -n "${FAKE_BEFORE_SCRIPT:-}" ]; then eval "$FAKE_BEFORE_SCRIPT"; fi
 if [ -n "${FAKE_BYPASS:-}" ]; then exec "$SNAP/usr/lib/chromium-browser/chrome" $FAKE_BYPASS_ARGS; fi
 exec bash -c "$script" "$@"

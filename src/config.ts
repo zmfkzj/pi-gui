@@ -1,5 +1,6 @@
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
+import { PROFILE_NAME } from "../bin/pi-gui-snap-chromium.mjs";
 
 /** Upstream tool surface: `compact` = help/dispatch (`mcp --compact-tools`), `direct` = the six operations. */
 export type ToolMode = "compact" | "direct";
@@ -27,6 +28,11 @@ export interface GuiConfig {
    * with a fixed profile). Off: worker desktops open only browsers with a disposable profile (src/browsers.ts).
    */
   allowWorkerUserBrowserProfiles: boolean;
+  /**
+   * Workers of writing roles: also offer the snap Chromium with this persistent agent-only profile
+   * (`~/snap/chromium/common/pi-gui-profiles/<name>`), whose sign-ins survive browser restarts and desktops. null: none.
+   */
+  workerBrowserProfile: string | null;
   /** Pi's per-request MCP timeout. The first call of a session starts the private desktop (up to 120 s upstream). */
   timeoutSeconds: number;
   /** Extra environment for the server. Physical-session variables are removed afterwards in private mode. */
@@ -45,14 +51,15 @@ export const DEFAULT_GUI_CONFIG: Readonly<GuiConfig> = Object.freeze({
   exposure: "direct",
   allowPhysicalDesktop: false,
   allowWorkerUserBrowserProfiles: false,
+  workerBrowserProfile: null,
   timeoutSeconds: 150,
   env: {},
   viewerCommand: null,
 });
 
 export const CONFIG_FILE = "gui.config.json";
-/** Keys a project file may not set: they decide which program runs, whether the physical desktop is reachable and whether workers may open the user's browser profiles. */
-const USER_ONLY_KEYS: ReadonlySet<string> = new Set(["allowPhysicalDesktop", "allowWorkerUserBrowserProfiles", "command", "args", "env", "viewerCommand"]);
+/** Keys a project file may not set: they decide which program runs, whether the physical desktop is reachable and whether workers may open the user's browser profiles or keep sign-ins in an agent profile. */
+const USER_ONLY_KEYS: ReadonlySet<string> = new Set(["allowPhysicalDesktop", "allowWorkerUserBrowserProfiles", "workerBrowserProfile", "command", "args", "env", "viewerCommand"]);
 
 export interface LoadedGuiConfig {
   config: GuiConfig;
@@ -108,6 +115,10 @@ export function validateGuiConfig(value: unknown, options: { project?: boolean }
       case "timeoutSeconds":
         valid = typeof entry === "number" && Number.isInteger(entry) && entry >= 10 && entry <= 3600;
         expected = "an integer from 10 to 3600";
+        break;
+      case "workerBrowserProfile":
+        valid = entry === null || (typeof entry === "string" && PROFILE_NAME.test(entry));
+        expected = "null or a name of letters, digits, _ and - (starting with a letter or digit, at most 64 characters)";
         break;
       case "env":
         valid = isRecord(entry) && Object.values(entry).every(item => typeof item === "string");

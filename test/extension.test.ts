@@ -2,7 +2,7 @@
 // server environment, the worker capability and the process lifecycle go through Pi's actual pipeline.
 import assert from "node:assert/strict";
 import { existsSync, readFileSync, statSync } from "node:fs";
-import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
@@ -207,13 +207,20 @@ async function guiProvider(config: Record<string, unknown> = {}, options: { snap
   const agentDir = await mkdtemp(join(tmpdir(), "pi-gui-cfg-"));
   await writeFile(join(agentDir, "gui.config.json"), JSON.stringify({ env: { XDG_DATA_DIRS: await workerApps(options.apps) }, ...config }));
   let api: ExtensionAPI | undefined;
-  await startSession([noMcpJson(), pi => { api = pi; }, createGuiExtension({ snapChromium: options.snapChromium ?? noSnap, agentDir, resolve: resolveFake, prerequisites: ready })], []);
+  const { session } = await startSession([noMcpJson(), pi => { api = pi; }, createGuiExtension({ snapChromium: options.snapChromium ?? noSnap, agentDir, resolve: resolveFake, prerequisites: ready })], []);
   const request = (fields: Record<string, unknown>) => {
     let answer: CapabilityProvider | undefined;
     api!.events.emit(CAPABILITY_CHANNEL, { capability: "gui", cwd: process.cwd(), workerId: "W1", ...fields, provide: (value: CapabilityProvider) => { answer = value; } });
     return answer!;
   };
-  return { agentDir, request };
+  /** `/gui status` text. */
+  const status = async () => {
+    let text = "";
+    const ctx = { hasUI: true, cwd: process.cwd(), isProjectTrusted: () => false, ui: { notify: (value: string) => { text = value; }, setStatus: () => undefined } };
+    await session.extensionRunner.getCommand("gui")!.handler("status", ctx as never);
+    return text;
+  };
+  return { agentDir, request, status };
 }
 
 /** Run tool calls in a worker session loaded from `provider`; `extraTools` simulates a widened allowlist. */
@@ -357,6 +364,75 @@ test("worker capability: the installed snap Chromium runs only through pi-gui's 
   const optedIn = (await guiProvider({ allowWorkerUserBrowserProfiles: true }, { apps, snapChromium: () => ({ ok: true, userRuntime }) })).request({ role: "implement", readOnly: false });
   const [optedEnv] = await runWorker(optedIn, [launch("chromium_chromium.desktop")]);
   assert.equal(payload(optedEnv!.text).env.TMPDIR, process.env.TMPDIR ?? null);
+});
+
+test("worker capability: the agent profile only with the user's workerBrowserProfile, for writing roles, never as the link handler; busy refusals", async () => {
+  const userRuntime = await mkdtemp(join(tmpdir(), "pgr-"));
+  // No non-snap browser (as on this machine): pi-gui's temporary-profile entry is the only browser and the links' handler.
+  const apps = {
+    chromium_chromium: "Exec=/snap/bin/chromium %U\nX-SnapInstanceName=chromium\nCategories=Network;WebBrowser;\nMimeType=text/html;x-scheme-handler/http;x-scheme-handler/https;",
+    "google-chrome": "Exec=/nonexistent/google-chrome %U\nMimeType=text/html;x-scheme-handler/http;",
+  };
+  const snapOk = () => ({ ok: true as const, userRuntime });
+  const name = `t${process.pid}-ext`;
+  const launch = (id: string): [string, Record<string, unknown>] => [tool("launch_application"), { desktop_id: id }];
+
+  // Default (no workerBrowserProfile): exactly as before, the agent entry is refused and nothing persistent is offered.
+  const plainProvider = await guiProvider({}, { apps, snapChromium: snapOk });
+  const plain = plainProvider.request({ role: "implement", readOnly: false });
+  assert.doesNotMatch(await plainProvider.status(), /Agent browser profile/);
+  assert.doesNotMatch(plain.instructions, /agent browser profile/);
+  const [notOffered] = await runWorker(plain, [launch("pi-gui-chromium-agent-profile.desktop")]);
+  assert.equal(reachedServer(notOffered!), false);
+  assert.match(notOffered!.text, /agent browser profile is not offered here/);
+
+  const { request, status } = await guiProvider({ workerBrowserProfile: name }, { apps, snapChromium: snapOk });
+  assert.match(await status(), new RegExp(`\\nAgent browser profile "${name}" \\(workerBrowserProfile, sign-ins kept in \\S+/snap/chromium/common/pi-gui-profiles/${name}/chromium\\): pi-gui-chromium-agent-profile\\.desktop for writing-role workers, one desktop at a time`));
+  assert.match(await (await guiProvider({ workerBrowserProfile: name }, { apps, snapChromium: () => ({ ok: false, reason: "x" }) })).status(), /Agent browser profile .*not offered \(snap Chromium is not: x\)/);
+  const provider = request({ role: "implement", readOnly: false });
+  assert.match(provider.instructions, new RegExp(`agent browser profile "${name}": pi-gui-chromium-agent-profile\\.desktop .*kept across browser restarts and desktops.*one desktop at a time`));
+  assert.match(provider.instructions, /Web browsers: launch only pi-gui-chromium-temp-profile\.desktop\. It starts signed out/, "the temporary entry is still offered as before");
+  assert.notEqual(provider.key, plain.key, "turning the profile on replaces a reused worker");
+  assert.notEqual(provider.key, (await guiProvider({ workerBrowserProfile: `${name}-2` }, { apps, snapChromium: snapOk })).request({ role: "implement", readOnly: false }).key, "so does another profile");
+  const [agentLaunch, tempLaunch] = await runWorker(provider, [launch("pi-gui-chromium-agent-profile.desktop"), launch("pi-gui-chromium-temp-profile.desktop")]);
+  assert.equal(reachedServer(agentLaunch!), true, agentLaunch!.text);
+  assert.equal(reachedServer(tempLaunch!), true, tempLaunch!.text);
+  const env = payload(agentLaunch!.text).env;
+  const dataDir = env.XDG_DATA_DIRS!.split(":")[0]!;
+  const agentEntry = readFileSync(join(dataDir, "applications", "pi-gui-chromium-agent-profile.desktop"), "utf8");
+  const agentShim = /^Exec=(\/\S+) %U$/m.exec(agentEntry)?.[1];
+  assert.ok(agentShim && readFileSync(agentShim, "utf8").includes(`PI_GUI_SNAP_CHROMIUM_PROFILE='${name}'`), agentEntry);
+  // Links and $BROWSER stay with the temporary profile.
+  assert.ok(readFileSync(env.BROWSER!, "utf8").includes("PI_GUI_SNAP_CHROMIUM_PROFILE=''"));
+  assert.match(readFileSync(join(env.XDG_CONFIG_DIRS!.split(":")[0]!, "mimeapps.list"), "utf8"), /\[Default Applications\]\nx-scheme-handler\/http=pi-gui-chromium-temp-profile\.desktop;/);
+
+  // Busy: a live launch of this profile (here: a record naming this test process) on this or another desktop.
+  const launchDir = join(userRuntime, "snap.chromium", "pi-gui-launch-test");
+  await mkdir(launchDir, { recursive: true });
+  const record = (tag: string) => writeFile(join(launchDir, "owner.json"), JSON.stringify({ pid: process.pid, runtime: "/r", profile: "/p", agentProfile: name, display: "wayland-virtual-9", tag }));
+  const worker = request({ role: "implement", readOnly: false });
+  const ownTag = payload((await runWorker(worker, [launch("org.kde.kwrite.desktop")]))[0]!.text).env.PI_GUI_VIEW_TAG!;
+  await record("another-server");
+  const [refused, tempStill] = await runWorker(worker, [launch("pi-gui-chromium-agent-profile.desktop"), launch("pi-gui-chromium-temp-profile.desktop")]);
+  assert.equal(reachedServer(refused!), false);
+  assert.match(refused!.text, new RegExp(`agent browser profile "${name}" is already open on another private desktop \\(wayland-virtual-9.*one desktop at a time`));
+  assert.equal(reachedServer(tempStill!), true, "the temporary entry is not affected");
+  await record(ownTag);
+  const [again] = await runWorker(worker, [launch("pi-gui-chromium-agent-profile.desktop")]);
+  assert.match(again!.text, /already open on this desktop .*Use that window/);
+  await rm(launchDir, { recursive: true });
+  const [free] = await runWorker(worker, [launch("pi-gui-chromium-agent-profile.desktop")]);
+  assert.equal(reachedServer(free!), true, "free again once that launch is gone");
+
+  // Read-only roles, an unavailable snap Chromium and allowWorkerUserBrowserProfiles: not offered.
+  const readOnly = request({ role: "verify", readOnly: true });
+  assert.doesNotMatch(readOnly.instructions, /agent browser profile/);
+  const [readOnlyLaunch] = await runWorker(readOnly, [launch("pi-gui-chromium-agent-profile.desktop")]);
+  assert.match(readOnlyLaunch!.text, /agent browser profile is not offered here/);
+  const noSnapAnswer = (await guiProvider({ workerBrowserProfile: name }, { apps, snapChromium: () => ({ ok: false, reason: "x" }) })).request({ role: "implement", readOnly: false });
+  assert.doesNotMatch(noSnapAnswer.instructions, /agent browser profile/);
+  const userProfiles = (await guiProvider({ workerBrowserProfile: name, allowWorkerUserBrowserProfiles: true }, { apps, snapChromium: snapOk })).request({ role: "implement", readOnly: false });
+  assert.doesNotMatch(userProfiles.instructions, /agent browser profile/);
 });
 
 const fakeKrdpScript = fileURLToPath(new URL("./fixtures/fake-krdpserver.mjs", import.meta.url));
