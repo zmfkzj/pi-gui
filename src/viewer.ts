@@ -645,12 +645,12 @@ export function freerdpHasH264(buildconfig: string): boolean | undefined {
 }
 
 /** One line per RDP client found on this host, with its H.264 support where it can be read. Never connects anywhere. */
-export async function probeRdpClients(env: NodeJS.ProcessEnv = process.env, exists: (path: string) => boolean = path => !!probePath(path)): Promise<string[]> {
+export async function probeRdpClients(env: NodeJS.ProcessEnv = process.env, exists: (path: string) => boolean = path => !!probePath(path), timeoutMs = 10_000): Promise<string[]> {
   const lines: string[] = [];
   for (const name of FREERDP_CLIENTS) {
     const path = which(name, env);
     if (!path) continue;
-    const result = await run(path, ["/buildconfig"], { timeoutMs: 10_000 });
+    const result = await run(path, ["/buildconfig"], { timeoutMs });
     const h264 = freerdpHasH264(result.stdout + result.stderr);
     lines.push(`${name} (${path}): ${h264 === undefined ? "H.264 unknown" : h264 ? "H.264 yes — usable" : "H.264 no — cannot show krdp's stream"}`);
   }
@@ -661,7 +661,7 @@ export async function probeRdpClients(env: NodeJS.ProcessEnv = process.env, exis
   if (!which("remmina", env) && exists("/snap/bin/remmina")) lines.push("remmina (/snap/bin/remmina): snap build (bundles its own FreeRDP)");
   const flatpak = which("flatpak", env);
   if (flatpak) {
-    const result = await run(flatpak, ["list", "--app", "--columns=application"], { timeoutMs: 10_000 });
+    const result = await run(flatpak, ["list", "--app", "--columns=application"], { timeoutMs });
     for (const id of ["org.remmina.Remmina", "com.freerdp.FreeRDP", "org.kde.krdc"]) if (result.stdout.split("\n").some(line => line.trim() === id)) lines.push(`${id} (Flatpak)`);
   }
   return lines;

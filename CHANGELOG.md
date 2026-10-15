@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- `/gui install-deps` and a dependency report in `/gui doctor`, the same provider answering the oh-my-pi-extensions umbrella (`oh-my-pi-extensions:dependencies`, id `pi-gui`, `src/dependencies.ts`). The check covers the platform (Linux; bundled server Linux x64 glibc ≥ 2.39), `gui.config.json`, the server resolution with a 5 s `version` probe (the npx fallback is reported unverified, never run), the bundled npm server, every runner program and KWin plugin with its exact `sudo apt install --no-install-recommends` line, the optional `/gui view` programs and RDP client; the live desktop stays unverified until `/gui doctor`'s smoke test answers it. `install-deps` installs only the bundled server through npm and reports system packages, the cargo build and non-Linux hosts as manual steps.
+
 ### Fixed
 
 - An agent `act` paste while `/gui view` ran on the same desktop could freeze it for good: upstream pastes through the KDE portal's Clipboard, krdp reads every new selection at once for its RDP client, and xdg-desktop-portal-kde 6.6 then deadlocks. Every later call failed with "AT-SPI application discovery timed out" (screenshot-only `observe` and keyboard `act` too) and the viewer stopped taking input; only replacing the desktop (losing its apps and sign-ins) ended it. While a viewer runs, the routing hook now sends the paste as one keyboard `type` event (upstream's own non-clipboard path), on the direct tools and inside `dispatch`; text over 4,096 characters is refused before anything is sent. Live check: `npm run test:paste-view`.

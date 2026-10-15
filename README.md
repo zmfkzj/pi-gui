@@ -74,12 +74,51 @@ changing upstream:
   no process. This is also the way a worker browses the web interactively (rendered pages, tabs, clicks, forms,
   sign-in): see [Workers and web browsers](#workers-and-web-browsers).
 - `/gui` or `/gui status`: enabled state, MCP connection, backend, tool mode, desktop policy, private session id, health.
-- `/gui doctor`: the prerequisites with the packages to install, upstream `computer-use-mcp doctor` (host session), and a
-  real private-desktop smoke test through upstream's `call` command (starts the private session, lists its windows,
-  tears it down).
+- `/gui doctor`: the dependency report with what to do for each problem (see [Dependency check and install](#dependency-check-and-install)),
+  then the details: the prerequisites with the packages to install, upstream `computer-use-mcp doctor` (host session),
+  and a real private-desktop smoke test through upstream's `call` command (starts the private session, lists its
+  windows, tears it down).
+- `/gui install-deps`: installs what needs no privileges (the bundled server) and prints the exact commands for the rest.
 
 The status line shows `GUI: ready`, `GUI: ready · private session-…`, `GUI: starting`, `GUI: unavailable`, `GUI: error`
 or `GUI: workers only`.
+
+## Dependency check and install
+
+`/gui doctor`, `/gui install-deps` and the umbrella's `/oh-my-pi doctor|install-deps` (provider id `pi-gui`, contract in
+`src/dependencies.ts`) report one line per item: `ok`, `installed`, `warn` (optional feature), `error`, `failed`,
+`manual` or `unverified`, each problem with its remedy.
+
+What is checked (required unless marked optional):
+
+- **platform**: Linux only (error elsewhere: pi-gui has nothing to run on macOS or Windows); CPU and glibc are shown.
+- **gui.config.json**: the user's and (in a trusted project) the project's file parse and validate; an invalid file is
+  ignored as a whole, so it is an error with the problem named.
+- **computer-use-mcp server**: which server would run (configured `command`, the bundled npm binary, `computer-use-mcp`
+  on PATH) and whether it answers `version` within 5 s. The `npx -y` fallback is reported `unverified` and never run
+  by the check (it would download); a package launcher in `command` (npx, bunx, ...) is not probed either.
+- **bundled server** (optional): `@mirsella/opencode-computer-use-mcp`, Linux x64 with glibc ≥ 2.39 only. Not needed
+  when the server comes from `command` or PATH; on other CPUs or older glibc the remedy is the cargo build.
+- **private desktop: …**: every program of upstream's runner (`kwin_wayland`, `xdg-desktop-portal-kde`, also in
+  Ubuntu's `/usr/lib/<multiarch>/libexec`, `xdg-desktop-portal`, PipeWire, WirePlumber, D-Bus, AT-SPI, `gdbus`,
+  `setsid`, `bash`) and KWin's screencast and EIS plugins, each with its `sudo apt install --no-install-recommends …`
+  (or the `COMPUTER_USE_MCP_*_BIN` override to fix).
+- **private desktop (live)**: `unverified` in the check (no desktop is started: "live desktop not started; run /gui
+  doctor for the smoke test"); `/gui doctor` answers it with its smoke test (`ok` or `error`).
+- **/gui view** (optional): `krdpserver` (or `viewerCommand`), `openssl`, and an RDP client that decodes H.264 (FreeRDP
+  `/buildconfig`, Remmina, KRDC, Flatpak builds; never connects anywhere).
+
+The check itself only reads files and PATH and runs `computer-use-mcp version` (5 s) and the RDP clients' `/buildconfig`
+or `flatpak list` (5 s each); it never starts a desktop, runs npx or downloads anything.
+
+`/gui install-deps` installs automatically only the bundled server: `npm install --legacy-peer-deps` in this package's
+directory when the optional dependency is missing, the host can run it and no other server is configured or on PATH
+(in an npm-installed package it says to reinstall with `pi install` instead). It re-checks the binary afterwards and is
+safe to repeat (`ok`, "already installed"). Reported as `manual`, never run: the system packages (one exact
+`sudo apt install --no-install-recommends …` line for the private desktop, one for `/gui view`), the cargo build of
+`computer-use-mcp` on other CPUs/libc, fixing an invalid `gui.config.json` or a broken `COMPUTER_USE_MCP_*_BIN`
+override, and every non-Linux platform. RDP clients are left to you (`sudo snap install remmina` or Flatpak). Run
+`/reload` after installing.
 
 ## Private desktop only (unless you opt in)
 

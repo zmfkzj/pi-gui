@@ -8,8 +8,10 @@ import { DEFAULT_GUI_CONFIG, loadGuiConfig, type GuiConfig, type LoadedGuiConfig
 import { GuiLog } from "./log.ts";
 import { desktopGuidance, GUIDANCE_SECTION, OBSERVE_OPERATIONS, routeToolCall, sessionOf } from "./policy.ts";
 import {
-  backendVersion, checkPrerequisites, doctorStatuses, privateDesktopSmoke, upstreamDoctor, type PrerequisiteReport,
+  backendVersion, checkPrerequisites, doctorStatuses, privateDesktopSmoke, upstreamDoctor, type PrerequisiteReport, type SmokeResult,
 } from "./prerequisites.ts";
+import { formatDependencyReport, registerDependencyProvider, type DependencyProvider, type DependencyReport } from "./dependencies.ts";
+import { checkGui, installGui, LIVE_ITEM, PROVIDER, singleFlight, smokeItem, type GuiHealthDeps, type HealthContext } from "./health.ts";
 import {
   CAPABILITY_CHANNEL, GUI_CAPABILITY, guiSessionExtension, isCapabilityRequest, workerInstructions, workerMcpExtension,
 } from "./worker.ts";
@@ -43,6 +45,8 @@ export interface GuiExtensionOptions {
     start?: (target: string, session: PrivateSession) => Promise<RunningViewer>;
     prerequisites?: typeof checkViewerPrerequisites;
   };
+  /** Seams of the dependency check and install (`/gui doctor`, `/gui install-deps`, the umbrella's batch run). */
+  dependencies?: Partial<Omit<GuiHealthDeps, "agentDir">>;
 }
 
 type State = "off" | "workers" | "unavailable" | "starting" | "ready" | "error";
@@ -56,6 +60,21 @@ type State = "off" | "workers" | "unavailable" | "starting" | "ready" | "error";
 export function createGuiExtension(options: GuiExtensionOptions = {}) {
   return function gui(pi: ExtensionAPI): void {
     const agentDir = options.agentDir ?? getAgentDir();
+    // Dependency contract (src/dependencies.ts): registered first, so the umbrella's request is answered from load on.
+    const healthDeps: GuiHealthDeps = {
+      agentDir,
+      ...(options.resolve ? { resolve: config => options.resolve!(config) } : {}),
+      ...(options.prerequisites ? { prerequisites: options.prerequisites } : {}),
+      ...(options.viewer?.prerequisites ? { viewer: options.viewer.prerequisites } : {}),
+      ...options.dependencies,
+    };
+    const install = singleFlight((ctx: HealthContext) => installGui(ctx, healthDeps));
+    const provider: DependencyProvider<HealthContext> = {
+      ...PROVIDER,
+      check: ctx => checkGui(ctx, healthDeps),
+      install: ctx => install(ctx),
+    };
+    registerDependencyProvider(pi.events, provider);
     const log = new GuiLog(agentDir, "main");
     const webRoot = join(agentDir, "pi-gui", "worker-web");
     /** snap Chromium for workers: the machine check, and a shim path that xdg-mime accepts (browsers.ts PLAIN_EXEC_PATH). */
@@ -301,7 +320,7 @@ export function createGuiExtension(options: GuiExtensionOptions = {}) {
       const programs = viewerPrerequisites();
       const lines = [`Viewer (/gui view: KDE krdp over RDP, ${VIEW_HOST} only, portal pre-authorized inside the private desktop):`];
       for (const check of programs.checks) lines.push(`  ${check.ok ? "ok     " : "MISSING"} ${check.name}${check.ok ? ` — ${check.detail}` : ` — apt install ${check.apt}`}`);
-      const clients = await probeRdpClients();
+      const clients = await (options.dependencies?.rdpClients ?? probeRdpClients)();
       lines.push("  RDP clients on this host (krdp needs one that decodes H.264/AVC420):");
       if (clients.length) for (const line of clients) lines.push(`    ${line}`);
       else lines.push("    none found — e.g. `snap install remmina` or Flatpak org.remmina.Remmina / com.freerdp.FreeRDP (built with H.264)");
@@ -309,7 +328,7 @@ export function createGuiExtension(options: GuiExtensionOptions = {}) {
       return lines;
     };
 
-    const doctorReport = async (ctx: ExtensionContext): Promise<string> => {
+    const doctorReport = async (ctx: ExtensionContext): Promise<{ text: string; smoke?: SmokeResult }> => {
       const found = backend();
       const report = prerequisites ?? checkPrerequisites(found);
       const lines = ["Prerequisites for private desktops (upstream runner):"];
@@ -318,7 +337,7 @@ export function createGuiExtension(options: GuiExtensionOptions = {}) {
       if (!found) {
         lines.push(`Backend: ${resolution && !resolution.ok ? resolution.error : "unresolved"}`);
         lines.push(...await viewerDoctor());
-        return lines.join("\n");
+        return { text: lines.join("\n") };
       }
       lines.push(`Backend: ${found.label}${version ? `, version ${version}` : ""}`);
       if (ctx.hasUI) ctx.ui.notify("gui: running upstream doctor and a private desktop smoke test…", "info");
@@ -332,7 +351,28 @@ export function createGuiExtension(options: GuiExtensionOptions = {}) {
       log.write(`doctor: prerequisites ${report.ok ? "ok" : "missing"}, smoke ${smoke.ok ? "ok" : "failed"}`);
       lines.push(report.ok && smoke.ok ? "Health: ok" : `Health: ${report.ok ? "smoke test failed" : `missing ${report.missing.join(", ")}`}`);
       lines.push(...await viewerDoctor());
-      return lines.join("\n");
+      return { text: lines.join("\n"), smoke };
+    };
+
+    /**
+     * `/gui doctor`: the contract items with their remediation (the same check the umbrella runs), with the live item
+     * answered by the smoke test, then the detailed report above (upstream doctor, smoke test, viewer).
+     */
+    const doctorCommand = async (ctx: ExtensionContext): Promise<{ text: string; level: "info" | "warning" | "error" }> => {
+      const details = await doctorReport(ctx);
+      const checked = await provider.check(ctx);
+      const report: DependencyReport = { ...checked, items: checked.items.map(item => item.name === LIVE_ITEM ? smokeItem(details.smoke, log.path) : item) };
+      const { text, level } = formatDependencyReport(PROVIDER.label, report, "check");
+      return { text: `${text}\n\nDetails:\n${details.text}`, level };
+    };
+
+    const installCommand = async (ctx: ExtensionContext): Promise<{ text: string; level: "info" | "warning" | "error" }> => {
+      if (ctx.hasUI) ctx.ui.setStatus("gui-deps", "pi-gui: install-deps…");
+      try {
+        return formatDependencyReport(PROVIDER.label, await provider.install(ctx), "install");
+      } finally {
+        if (ctx.hasUI) ctx.ui.setStatus("gui-deps", undefined);
+      }
     };
 
     const viewCommand = async (words: string[], ctx: ExtensionContext): Promise<{ text: string; level: "info" | "warning" | "error" }> => {
@@ -370,9 +410,9 @@ export function createGuiExtension(options: GuiExtensionOptions = {}) {
       return { text: connectionMessage(outcome.viewer, outcome.kind, { replaced: !!outcome.replaced }), level: "info" };
     };
 
-    const SUBCOMMANDS = ["status", "doctor", "view", "view stop", "view stop all", "view list"];
+    const SUBCOMMANDS = ["status", "doctor", "install-deps", "view", "view stop", "view stop all", "view list"];
     pi.registerCommand("gui", {
-      description: "Private GUI desktop (computer-use-mcp): /gui status, /gui doctor, /gui view [name], /gui view stop [name|all], /gui view list",
+      description: "Private GUI desktop (computer-use-mcp): /gui status, /gui doctor, /gui install-deps, /gui view [name], /gui view stop [name|all], /gui view list",
       getArgumentCompletions: prefix => {
         const typed = prefix.trimStart();
         const names = views.list().map(target => target.name);
@@ -382,12 +422,19 @@ export function createGuiExtension(options: GuiExtensionOptions = {}) {
       handler: async (args, ctx) => {
         const [action = "status", ...rest] = args.trim().split(/\s+/).filter(Boolean);
         if (action === "status") return ctx.ui.notify(statusReport(), "info");
-        if (action === "doctor") return ctx.ui.notify(await doctorReport(ctx), "info");
+        if (action === "doctor") {
+          const { text, level } = await doctorCommand(ctx);
+          return ctx.ui.notify(text, level);
+        }
+        if (action === "install-deps") {
+          const { text, level } = await installCommand(ctx);
+          return ctx.ui.notify(text, level);
+        }
         if (action === "view") {
           const { text, level } = await viewCommand(rest, ctx);
           return ctx.ui.notify(text, level);
         }
-        ctx.ui.notify("Usage: /gui [status|doctor|view [name]|view stop [name|all]|view list]", "warning");
+        ctx.ui.notify("Usage: /gui [status|doctor|install-deps|view [name]|view stop [name|all]|view list]", "warning");
       },
     });
   };
