@@ -107,7 +107,8 @@ What is checked (required unless marked optional):
   doctor for the smoke test"); `/gui doctor` answers it with its smoke test (`ok` or `error`).
 - **/gui view** (optional): `krdpserver` (or `viewerCommand`), `openssl`, and an RDP client that decodes H.264 (FreeRDP
   `/buildconfig`, Remmina, KRDC, Flatpak builds; never connects anywhere). `/gui view` itself opens one automatically
-  (FreeRDP with H.264 or Remmina; [Automatic connection](#automatic-connection)).
+  (FreeRDP with H.264 or Remmina; [Automatic connection](#automatic-connection)), except in a herdr pane, where
+  herdr-web-ui shows the desktop in the browser.
 
 The check itself only reads files and PATH and runs `computer-use-mcp version` (5 s) and the RDP clients' `/buildconfig`
 or `flatpak list` (5 s each); it never starts a desktop, runs npx or downloads anything.
@@ -406,7 +407,7 @@ set `allowPhysicalDesktop`, `allowWorkerUserBrowserProfiles`, `workerBrowserProf
   "timeoutSeconds": 150,
   "env": {},
   "viewerCommand": null,
-  "viewerAutoConnect": true
+  "viewerAutoConnect": "auto"
 }
 ```
 
@@ -425,7 +426,7 @@ set `allowPhysicalDesktop`, `allowWorkerUserBrowserProfiles`, `workerBrowserProf
 | `timeoutSeconds` | `150` | Pi's MCP request timeout. The first call of a session starts the private desktop (upstream allows 120 s). |
 | `env` | `{}` | Extra server environment (e.g. `RUST_LOG`). Physical-session variables are still removed. |
 | `viewerCommand` | `null` | User config only. The `/gui view` server; `null`: `krdpserver` on PATH, then `/usr/bin/krdpserver`. |
-| `viewerAutoConnect` | `true` | User config only. `/gui view` also opens an RDP client on your screen, connected to the viewer (see [Automatic connection](#automatic-connection)). `false`: only the connection details are printed. |
+| `viewerAutoConnect` | `"auto"` | User config only. `/gui view` also opens an RDP client on your screen, connected to the viewer (see [Automatic connection](#automatic-connection)). `"auto"`: except when Pi runs in a herdr pane (herdr-web-ui shows the desktop in the browser); `true`: always; `false`: only the connection details are printed. |
 
 Measured with Pi 1.0.2 and `cliproxyapi/claude-opus-5-5` (thinking low), one prompt each:
 
@@ -543,7 +544,8 @@ Procedure (worker stuck at a sign-in):
    that screen). It is now idle: give it no assignment while you operate its desktop.
 2. `/gui view W1` prints `127.0.0.1:<port>`, user `pi`, a one-time password and the certificate's SHA-256 fingerprint,
    and opens an RDP client on your screen pointed at it ([Automatic connection](#automatic-connection)); the
-   message says which client it opened, or why it could not. Without one, continue with step 3.
+   message says which client it opened, or why it did not (in a herdr pane, herdr-web-ui opens the desktop in the browser
+   that ran the command instead). Without one, continue with step 3.
 3. Connect by hand with an RDP client that decodes H.264, e.g.
    `xfreerdp3 /v:127.0.0.1:<port> /u:pi /sec:tls /gfx:avc420 /cert:fingerprint:sha256:<hex>` (asks for the password), or
    Remmina (snap/Flatpak): RDP profile, server `127.0.0.1:<port>`, user `pi`, Advanced > Security protocol negotiation
@@ -578,7 +580,16 @@ only).
 
 Each `/gui view` (only that command; never `/gui status`, `/gui doctor`, a worker or a browser launch) also opens an RDP
 client on your own screen for the viewer it started or found (`src/client.ts`). The client runs with Pi's environment,
-i.e. in the graphical session Pi was started from, not inside the private desktop. Which client:
+i.e. in the graphical session Pi was started from, not inside the private desktop.
+
+herdr panes (`viewerAutoConnect: "auto"`, the default): when Pi runs in a herdr pane (`HERDR_PANE_ID` is set), no client
+is opened and the message says why. [herdr-web-ui](https://github.com/zmfkzj/herdr-web-ui) (`docs/pi-visual-tools.md`)
+notices `/gui view <name>` sent from its own browser to that pane and opens the desktop right there, through its guacd,
+without the password; that browser is often on another device, where a client popping up on this PC's screen would go
+unseen and hold a second RDP session. This is a conservative guess, not knowledge of a browser: herdr used in a terminal
+on this PC is skipped too. `"viewerAutoConnect": true` opens the client everywhere (herdr included), `false` nowhere.
+
+Which client:
 
 1. A FreeRDP command-line client (`xfreerdp3`, `sdl-freerdp3`, `wlfreerdp3`, then the 2.x names) whose `/buildconfig` says
    `WITH_GFX_H264=ON`: `/v:127.0.0.1:<port> /u:pi /p:<password> /sec:tls /gfx:avc420 /cert:fingerprint:sha256:<hex>`.
@@ -600,7 +611,7 @@ shutdown), each only if unchanged. Remmina keeps its own small state file (last 
 profiles, certificates and the running Remmina are never changed or closed. A repeated `/gui view` opens the client again,
 except while the FreeRDP client it opened before still runs (a Remmina window cannot be watched: it belongs to Remmina's
 running instance). "Opened" means the client process started: whether sign-in and the picture work is up to the client
-(see Clients). `"viewerAutoConnect": false` in `~/.pi/agent/gui.config.json` turns this off.
+(see Clients). `"viewerAutoConnect": false` in `~/.pi/agent/gui.config.json` turns this off; `true` also opens it in herdr panes.
 
 Clients: krdp streams only H.264 (AVC420) over the RDP graphics pipeline and drops clients that cannot decode it
 (krdp's own message: "Client does not support H.264 in YUV420 mode!"). What matters is the client's FreeRDP build

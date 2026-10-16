@@ -10,7 +10,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
 import {
-  autoConnect, certificateStorePath, clientEnv, connectClient, findRdpClient, remminaEncrypt, remminaPaths, remminaProfile, remminaSecret,
+  autoConnect, autoConnectSkip, certificateStorePath, clientEnv, connectClient, findRdpClient, remminaEncrypt, remminaPaths, remminaProfile, remminaSecret,
 } from "../src/client.ts";
 import { DEFAULT_GUI_CONFIG, validateGuiConfig } from "../src/config.ts";
 import { connectionMessage, MARKER_ENV, runCleanups, VIEW_HOST, VIEW_TAG_ENV, VIEW_USER, ViewRegistry, type PrivateSession, type RunningViewer } from "../src/viewer.ts";
@@ -209,10 +209,13 @@ test("connection message: client line, password redacted from client errors, man
   assert.doesNotMatch(connectionMessage(viewer, "started"), /RDP client:/, "no auto-connect configured: the old message");
 });
 
-test("config: viewerAutoConnect is a boolean, on by default, user config only", () => {
-  assert.equal(DEFAULT_GUI_CONFIG.viewerAutoConnect, true);
+test("config: viewerAutoConnect is a boolean or \"auto\", \"auto\" by default, user config only", () => {
+  assert.equal(DEFAULT_GUI_CONFIG.viewerAutoConnect, "auto");
   assert.deepEqual(validateGuiConfig({ viewerAutoConnect: false }), { viewerAutoConnect: false });
-  assert.throws(() => validateGuiConfig({ viewerAutoConnect: "no" }), /viewerAutoConnect must be a boolean/);
+  assert.deepEqual(validateGuiConfig({ viewerAutoConnect: true }), { viewerAutoConnect: true });
+  assert.deepEqual(validateGuiConfig({ viewerAutoConnect: "auto" }), { viewerAutoConnect: "auto" });
+  assert.throws(() => validateGuiConfig({ viewerAutoConnect: "no" }), /viewerAutoConnect must be a boolean or "auto"/);
+  assert.throws(() => validateGuiConfig({ viewerAutoConnect: "auto" }, { project: true }), /only allowed in the user config/);
   assert.throws(() => validateGuiConfig({ viewerAutoConnect: true }, { project: true }), /only allowed in the user config/);
 });
 
@@ -252,4 +255,15 @@ test("view registry: auto-connect runs inside the target's section, so stop/rele
   assert.ok(events.includes("log view W1: could not open a client: exploded with <password>"));
   await registry.release("t1");
   assert.ok(events.includes("cleanup 41002"), "release (the worker ended) runs the cleanup too");
+});
+
+test("autoConnectSkip: \"auto\" leaves herdr panes to herdr-web-ui's in-browser viewer; true and false are kept as set", () => {
+  const file = "/home/u/.pi/agent/gui.config.json";
+  const herdr = { HERDR_PANE_ID: "w3:p3", HERDR_ENV: "1", WAYLAND_DISPLAY: "wayland-0" };
+  assert.equal(autoConnectSkip("auto", { WAYLAND_DISPLAY: "wayland-0" }, file), undefined, "a plain terminal still gets the client");
+  assert.equal(autoConnectSkip("auto", { HERDR_PANE_ID: "", HERDR_ENV: "1" }, file), undefined, "only a pane id counts");
+  assert.match(autoConnectSkip("auto", herdr, file)!, /^Pi runs in herdr pane w3:p3: herdr-web-ui shows this desktop in the browser that ran \/gui view; .*"viewerAutoConnect": true in \/home\/u\/\.pi\/agent\/gui\.config\.json$/);
+  assert.equal(autoConnectSkip(true, herdr, file), undefined, "true opens the client in herdr too");
+  assert.equal(autoConnectSkip(false, {}, file), `"viewerAutoConnect": false in ${file}`);
+  assert.equal(autoConnectSkip(false, herdr, file), `"viewerAutoConnect": false in ${file}`);
 });

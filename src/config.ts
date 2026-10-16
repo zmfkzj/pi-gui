@@ -39,8 +39,12 @@ export interface GuiConfig {
   env: Record<string, string>;
   /** `/gui view` server (KDE's krdp). null: `krdpserver` on PATH, then /usr/bin/krdpserver. */
   viewerCommand: string | null;
-  /** `/gui view` also opens an RDP client on the user's screen, connected to the viewer (src/client.ts). */
-  viewerAutoConnect: boolean;
+  /**
+   * `/gui view` also opens an RDP client on the user's screen, connected to the viewer (src/client.ts). "auto": unless Pi
+   * runs in a herdr pane, where herdr-web-ui shows the desktop in the browser that ran `/gui view` (src/client.ts
+   * autoConnectSkip); true: always; false: never.
+   */
+  viewerAutoConnect: boolean | "auto";
 }
 
 export const DEFAULT_GUI_CONFIG: Readonly<GuiConfig> = Object.freeze({
@@ -57,7 +61,7 @@ export const DEFAULT_GUI_CONFIG: Readonly<GuiConfig> = Object.freeze({
   timeoutSeconds: 150,
   env: {},
   viewerCommand: null,
-  viewerAutoConnect: true,
+  viewerAutoConnect: "auto",
 });
 
 export const CONFIG_FILE = "gui.config.json";
@@ -94,9 +98,12 @@ export function validateGuiConfig(value: unknown, options: { project?: boolean }
       case "mainSession":
       case "allowPhysicalDesktop":
       case "allowWorkerUserBrowserProfiles":
-      case "viewerAutoConnect":
         valid = typeof entry === "boolean";
         expected = "a boolean";
+        break;
+      case "viewerAutoConnect":
+        valid = typeof entry === "boolean" || entry === "auto";
+        expected = 'a boolean or "auto"';
         break;
       case "command":
       case "viewerCommand":

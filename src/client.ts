@@ -146,6 +146,21 @@ function launch(spawnFn: NonNullable<ClientDeps["spawn"]>, program: string, args
 const alive = (pid: number): boolean => { try { process.kill(pid, 0); return true; } catch (error) { return (error as NodeJS.ErrnoException).code === "EPERM"; } };
 
 /**
+ * Why `/gui view` opens no RDP client this time, or undefined to open one. `choice` is `viewerAutoConnect`; `configFile`
+ * names where to change it. "auto" skips the client when Pi runs in a herdr pane (`HERDR_PANE_ID`, which herdr sets for
+ * every pane's processes): herdr-web-ui opens the desktop in the browser that ran `/gui view`, usually on another device,
+ * and a client here would only pop up on this PC's screen and hold a second RDP session. That is a conservative guess,
+ * not knowledge of a browser: herdr used in a terminal on this PC is skipped too, and `true` brings the client back.
+ */
+export function autoConnectSkip(choice: boolean | "auto", env: NodeJS.ProcessEnv, configFile: string): string | undefined {
+  if (choice === false) return `"viewerAutoConnect": false in ${configFile}`;
+  if (choice === "auto" && env.HERDR_PANE_ID) {
+    return `Pi runs in herdr pane ${env.HERDR_PANE_ID}: herdr-web-ui shows this desktop in the browser that ran /gui view; for a client on this PC's screen too, set "viewerAutoConnect": true in ${configFile}`;
+  }
+  return undefined;
+}
+
+/**
  * `/gui view`'s auto-connect step: a new viewer always gets a client; a running one gets another only when the client
  * opened for it before is not running any more (FreeRDP; a Remmina launch hands over to Remmina's running instance, so
  * its window cannot be watched and a repeated `/gui view` opens it again).

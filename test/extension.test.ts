@@ -454,12 +454,14 @@ test("/gui view: a worker's private desktop over loopback RDP, stopped with the 
     (viewer.cleanups ??= []).push(() => cleaned.push(viewer.port));
     return { ok: true as const, client: "FakeRDP (/fake/rdp)", detail: `TLS pinned; profile /fake/${viewer.port}.remmina` };
   };
+  // Pi's environment for viewerAutoConnect "auto": not a herdr pane, whatever pane runs this test
+  const piEnv: NodeJS.ProcessEnv = {};
   let api: ExtensionAPI | undefined;
   const cfg = await mkdtemp(join(tmpdir(), "pi-gui-cfg-"));
   await writeFile(join(cfg, "gui.config.json"), JSON.stringify({ env: { XDG_DATA_DIRS: await workerApps() } }));
   const main = await startSession([
     noMcpJson(), pi => { api = pi; },
-    createGuiExtension({ snapChromium: noSnap, agentDir: cfg, resolve: resolveFake, prerequisites: ready, viewer: { prerequisites: viewerReady, connect } }),
+    createGuiExtension({ snapChromium: noSnap, agentDir: cfg, resolve: resolveFake, prerequisites: ready, viewer: { prerequisites: viewerReady, connect, env: piEnv } }),
   ], []);
   const notes: { text: string; level?: string }[] = [];
   const gui = main.session.extensionRunner.getCommand("gui")!;
@@ -515,8 +517,18 @@ test("/gui view: a worker's private desktop over loopback RDP, stopped with the 
   assert.match((await command("view stop")).text, /Stopped the viewer of W1/);
   assert.equal(isAlive(seen.pid), false);
   assert.deepEqual(cleaned, [port, port], "stopping the viewer removed what the client was given (once per connect)");
+  // "auto" (the default) in a herdr pane: herdr-web-ui shows the desktop in the browser, so no client pops up here
+  piEnv.HERDR_PANE_ID = "w1:p2";
   const reopened = await command("view W1");
   assert.match(reopened.text, /Started a remote desktop/);
+  assert.equal(connects.length, 2, "no client in a herdr pane");
+  assert.match(reopened.text, /RDP client: not opened automatically \(Pi runs in herdr pane w1:p2: herdr-web-ui shows this desktop/);
+  assert.match(reopened.text, /"viewerAutoConnect": true/);
+  assert.match(reopened.text, /xfreerdp3 \/v:127\.0\.0\.1:\d+/, "the manual way stays in the message");
+  // outside herdr the same running viewer gets its client on the next /gui view
+  delete piEnv.HERDR_PANE_ID;
+  assert.match((await command("view W1")).text, /Already running[\s\S]*RDP client: opened FakeRDP/);
+  assert.deepEqual(connects.map(item => item.kind), ["started", "running", "running"]);
   const second = JSON.parse(readFileSync(record, "utf8"));
   assert.notEqual(second.options.password, password, "a new password per viewer");
   await shutdown(worker.session);

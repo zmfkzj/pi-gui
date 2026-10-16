@@ -23,7 +23,7 @@ import {
   checkViewerPrerequisites, connectionMessage, findPrivateSession, newViewTag, probeRdpClients, startViewer, VIEW_HOST, ViewRegistry, withViewTag,
   type ClientOutcome, type PrivateSession, type RunningViewer, type SessionLookup,
 } from "./viewer.ts";
-import { autoConnect } from "./client.ts";
+import { autoConnect, autoConnectSkip } from "./client.ts";
 
 /** Every live registry, so one exit hook can stop every viewer synchronously if Pi exits without a session shutdown. */
 const registries = new Set<ViewRegistry>();
@@ -48,6 +48,8 @@ export interface GuiExtensionOptions {
     prerequisites?: typeof checkViewerPrerequisites;
     /** Opens the RDP client on `/gui view` (default: src/client.ts autoConnect, a real client on the user's screen). */
     connect?: (viewer: RunningViewer, kind: "started" | "running") => Promise<ClientOutcome>;
+    /** Pi's environment for the `viewerAutoConnect: "auto"` herdr check (default: process.env). */
+    env?: NodeJS.ProcessEnv;
   };
   /** Seams of the dependency check and install (`/gui doctor`, `/gui install-deps`, the umbrella's batch run). */
   dependencies?: Partial<Omit<GuiHealthDeps, "agentDir">>;
@@ -121,10 +123,11 @@ export function createGuiExtension(options: GuiExtensionOptions = {}) {
         if (!programs.krdp || !programs.openssl) return Promise.reject(new Error(`missing ${programs.missing.join(", ")}`));
         return startViewer(target, session, { krdp: programs.krdp, openssl: programs.openssl, ...(programs.gdbus ? { gdbus: programs.gdbus } : {}), log: line => log.write(line) });
       }),
-      // Only the explicit `/gui view` command reaches this (ViewRegistry.view); the user's config can turn it off.
-      connect: (viewer, kind) => loaded.config.viewerAutoConnect
-        ? (options.viewer?.connect ?? autoConnect)(viewer, kind)
-        : Promise.resolve({ skipped: `"viewerAutoConnect": false in ${join(agentDir, "gui.config.json")}` }),
+      // Only the explicit `/gui view` command reaches this (ViewRegistry.view); the user's config decides (autoConnectSkip).
+      connect: (viewer, kind) => {
+        const skipped = autoConnectSkip(loaded.config.viewerAutoConnect, options.viewer?.env ?? process.env, join(agentDir, "gui.config.json"));
+        return skipped ? Promise.resolve({ skipped }) : (options.viewer?.connect ?? autoConnect)(viewer, kind);
+      },
       log: line => log.write(line),
     });
     trackRegistry(views);
