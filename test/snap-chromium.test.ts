@@ -20,6 +20,7 @@ import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import { after, test } from "node:test";
 import { fileURLToPath } from "node:url";
+import { listenSocket } from "./fixtures/socket-path.ts";
 import {
   agentProfilePaths, agentProfileUse, BROWSER_FLAGS, browserArguments, browserEnvironment, chainReason, commandChain, currentRevision, findBrowser, inSnapScript, launchCommand, launchDir,
   LAUNCH_SUBDIRS, lockAgentProfile, prepareAgentProfile, privateDesktop, profileOf, readRecord, REFUSED_EXIT, runtimeSpaceReason, snapChromiumReason, snapRuntimeDir, supervise,
@@ -107,7 +108,7 @@ async function fakeDesktop(options: { outside?: boolean; userRuntime?: string; d
   const display = options.display ?? "wayland-virtual-4242";
   for (const name of [display, "bus", "at-spi/bus"]) {
     const server = createServer();
-    await new Promise<void>(resolve => server.listen(join(runtime, name), resolve));
+    await new Promise<void>(resolve => listenSocket(server, join(runtime, name), resolve));
     servers.push(server);
   }
   const marker = join(runtime, "isolation.ready");

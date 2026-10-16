@@ -16,6 +16,7 @@ import {
   type PathInfo, type PrivateSession, type ProcSource, type RunningViewer,
 } from "../src/viewer.ts";
 import { workerIdOfSessionFile, workerInstructions } from "../src/worker.ts";
+import { listenSocket } from "./fixtures/socket-path.ts";
 
 const FAKE_KRDP = fileURLToPath(new URL("./fixtures/fake-krdpserver.mjs", import.meta.url));
 const uid = process.getuid!();
@@ -120,7 +121,7 @@ async function realSession(tag: string): Promise<{ session: PrivateSession; serv
   const dir = await mkdtemp(join(tmpdir(), "computer-use-mcp-isolated-"));
   await chmod(dir, 0o700);
   const display = `wayland-virtual-${process.pid}${Math.floor(Math.random() * 1000)}`;
-  const servers: Server[] = await Promise.all([display, "bus"].map(name => new Promise<Server>(resolve => { const server = createServer().listen(join(dir, name), () => resolve(server)); })));
+  const servers: Server[] = await Promise.all([display, "bus"].map(name => new Promise<Server>(resolve => { const server = listenSocket(createServer(), join(dir, name), () => resolve(server)); })));
   await writeFile(join(dir, "isolation.ready"), "ok\n");
   const session: PrivateSession = { runtimeDir: dir, display, marker: join(dir, "isolation.ready"), pids: [] };
   const service = spawn(process.execPath, ["-e", "setInterval(() => {}, 1 << 30)"], { env: { ...process.env, ...sessionEnv(tag, dir, display) }, stdio: "ignore" });

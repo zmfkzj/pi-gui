@@ -8,6 +8,7 @@ import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
+import { listenSocket } from "./socket-path.ts";
 
 const [command, ...rest] = process.argv.slice(2);
 const SESSION = `session-${(process.pid % 0xffff).toString(16).padStart(16, "0")}`;
@@ -24,7 +25,7 @@ function ensurePrivateSession() {
   chmodSync(dir, 0o700);
   const display = `wayland-virtual-${process.pid}`;
   const marker = join(dir, "isolation.ready");
-  const sockets = [display, "bus"].map(name => createServer().listen(join(dir, name)));
+  const sockets = [display, "bus"].map(name => listenSocket(createServer(), join(dir, name)));
   writeFileSync(marker, `runtime_dir=${dir}\n`);
   const sessionEnv = { ...process.env, XDG_RUNTIME_DIR: dir, WAYLAND_DISPLAY: display, DBUS_SESSION_BUS_ADDRESS: `unix:path=${dir}/bus`, COMPUTER_USE_MCP_ISOLATION_MARKER: marker };
   const service = spawn(process.execPath, ["-e", "setInterval(() => {}, 1 << 30)"], { env: sessionEnv, stdio: "ignore" });
