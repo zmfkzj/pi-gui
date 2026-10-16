@@ -39,6 +39,8 @@ export interface GuiConfig {
   env: Record<string, string>;
   /** `/gui view` server (KDE's krdp). null: `krdpserver` on PATH, then /usr/bin/krdpserver. */
   viewerCommand: string | null;
+  /** `/gui view` also opens an RDP client on the user's screen, connected to the viewer (src/client.ts). */
+  viewerAutoConnect: boolean;
 }
 
 export const DEFAULT_GUI_CONFIG: Readonly<GuiConfig> = Object.freeze({
@@ -55,11 +57,12 @@ export const DEFAULT_GUI_CONFIG: Readonly<GuiConfig> = Object.freeze({
   timeoutSeconds: 150,
   env: {},
   viewerCommand: null,
+  viewerAutoConnect: true,
 });
 
 export const CONFIG_FILE = "gui.config.json";
 /** Keys a project file may not set: they decide which program runs, whether the physical desktop is reachable and whether workers may open the user's browser profiles or keep sign-ins in an agent profile. */
-const USER_ONLY_KEYS: ReadonlySet<string> = new Set(["allowPhysicalDesktop", "allowWorkerUserBrowserProfiles", "workerBrowserProfile", "command", "args", "env", "viewerCommand"]);
+const USER_ONLY_KEYS: ReadonlySet<string> = new Set(["allowPhysicalDesktop", "allowWorkerUserBrowserProfiles", "workerBrowserProfile", "command", "args", "env", "viewerCommand", "viewerAutoConnect"]);
 
 export interface LoadedGuiConfig {
   config: GuiConfig;
@@ -91,6 +94,7 @@ export function validateGuiConfig(value: unknown, options: { project?: boolean }
       case "mainSession":
       case "allowPhysicalDesktop":
       case "allowWorkerUserBrowserProfiles":
+      case "viewerAutoConnect":
         valid = typeof entry === "boolean";
         expected = "a boolean";
         break;

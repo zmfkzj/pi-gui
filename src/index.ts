@@ -21,8 +21,9 @@ import {
 import { agentProfilePaths, agentProfileUse } from "../bin/pi-gui-snap-chromium.mjs";
 import {
   checkViewerPrerequisites, connectionMessage, findPrivateSession, newViewTag, probeRdpClients, startViewer, VIEW_HOST, ViewRegistry, withViewTag,
-  type PrivateSession, type RunningViewer, type SessionLookup,
+  type ClientOutcome, type PrivateSession, type RunningViewer, type SessionLookup,
 } from "./viewer.ts";
+import { autoConnect } from "./client.ts";
 
 /** Every live registry, so one exit hook can stop every viewer synchronously if Pi exits without a session shutdown. */
 const registries = new Set<ViewRegistry>();
@@ -45,6 +46,8 @@ export interface GuiExtensionOptions {
     find?: (tag: string) => SessionLookup;
     start?: (target: string, session: PrivateSession) => Promise<RunningViewer>;
     prerequisites?: typeof checkViewerPrerequisites;
+    /** Opens the RDP client on `/gui view` (default: src/client.ts autoConnect, a real client on the user's screen). */
+    connect?: (viewer: RunningViewer, kind: "started" | "running") => Promise<ClientOutcome>;
   };
   /** Seams of the dependency check and install (`/gui doctor`, `/gui install-deps`, the umbrella's batch run). */
   dependencies?: Partial<Omit<GuiHealthDeps, "agentDir">>;
@@ -118,6 +121,10 @@ export function createGuiExtension(options: GuiExtensionOptions = {}) {
         if (!programs.krdp || !programs.openssl) return Promise.reject(new Error(`missing ${programs.missing.join(", ")}`));
         return startViewer(target, session, { krdp: programs.krdp, openssl: programs.openssl, ...(programs.gdbus ? { gdbus: programs.gdbus } : {}), log: line => log.write(line) });
       }),
+      // Only the explicit `/gui view` command reaches this (ViewRegistry.view); the user's config can turn it off.
+      connect: (viewer, kind) => loaded.config.viewerAutoConnect
+        ? (options.viewer?.connect ?? autoConnect)(viewer, kind)
+        : Promise.resolve({ skipped: `"viewerAutoConnect": false in ${join(agentDir, "gui.config.json")}` }),
       log: line => log.write(line),
     });
     trackRegistry(views);
@@ -419,7 +426,7 @@ export function createGuiExtension(options: GuiExtensionOptions = {}) {
       if (ctx.hasUI) ctx.ui.notify(`gui: starting a viewer for ${resolved.target.name}…`, "info");
       const outcome = await views.view(resolved.target);
       if (outcome.kind === "error") return { text: `Cannot open a viewer: ${outcome.message}`, level: "error" };
-      return { text: connectionMessage(outcome.viewer, outcome.kind, { replaced: !!outcome.replaced }), level: "info" };
+      return { text: connectionMessage(outcome.viewer, outcome.kind, { replaced: !!outcome.replaced, ...(outcome.client ? { client: outcome.client } : {}) }), level: "info" };
     };
 
     const SUBCOMMANDS = ["status", "doctor", "install-deps", "view", "view stop", "view stop all", "view list"];

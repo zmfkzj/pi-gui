@@ -132,7 +132,7 @@ async function main() {
   // The test editor's launcher runs python3, which worker desktops refuse unless the user opts out of the launch checks.
   writeFileSync(join(agentDir, "gui.config.json"), JSON.stringify({ mainSession: false, allowWorkerUserBrowserProfiles: true }));
   let api: ExtensionAPI | undefined;
-  const main = await agent([createMcpExtension({ loadConfig: () => ({ servers: [], errors: [], autoEnableCodemode: false }) }), pi => { api = pi; }, createGuiExtension({ agentDir })], agentDir);
+  const main = await agent([createMcpExtension({ loadConfig: () => ({ servers: [], errors: [], autoEnableCodemode: false }) }), pi => { api = pi; }, createGuiExtension({ agentDir, viewer: { connect: async () => ({ skipped: "live test: no client on the user's screen" }) } })], agentDir);
   const gui = main.session.extensionRunner.getCommand("gui")!;
   const notes: { text: string; level?: string }[] = [];
   const ctx = { hasUI: true, ui: { notify: (text: string, level?: string) => notes.push({ text, level }) } } as unknown as Parameters<typeof gui.handler>[1];

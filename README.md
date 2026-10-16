@@ -106,7 +106,8 @@ What is checked (required unless marked optional):
 - **private desktop (live)**: `unverified` in the check (no desktop is started: "live desktop not started; run /gui
   doctor for the smoke test"); `/gui doctor` answers it with its smoke test (`ok` or `error`).
 - **/gui view** (optional): `krdpserver` (or `viewerCommand`), `openssl`, and an RDP client that decodes H.264 (FreeRDP
-  `/buildconfig`, Remmina, KRDC, Flatpak builds; never connects anywhere).
+  `/buildconfig`, Remmina, KRDC, Flatpak builds; never connects anywhere). `/gui view` itself opens one automatically
+  (FreeRDP with H.264 or Remmina; [Automatic connection](#automatic-connection)).
 
 The check itself only reads files and PATH and runs `computer-use-mcp version` (5 s) and the RDP clients' `/buildconfig`
 or `flatpak list` (5 s each); it never starts a desktop, runs npx or downloads anything.
@@ -388,7 +389,7 @@ which would be on another worker's desktop. So:
 ## Configuration
 
 `~/.pi/agent/gui.config.json`, optionally overridden key by key by a trusted project's `.pi/gui.config.json` (which may not
-set `allowPhysicalDesktop`, `allowWorkerUserBrowserProfiles`, `workerBrowserProfile`, `command`, `args`, `env` or `viewerCommand`). Unknown keys or wrong types reject the whole file with a warning.
+set `allowPhysicalDesktop`, `allowWorkerUserBrowserProfiles`, `workerBrowserProfile`, `command`, `args`, `env`, `viewerCommand` or `viewerAutoConnect`). Unknown keys or wrong types reject the whole file with a warning.
 
 ```json
 {
@@ -403,7 +404,9 @@ set `allowPhysicalDesktop`, `allowWorkerUserBrowserProfiles`, `workerBrowserProf
   "allowWorkerUserBrowserProfiles": false,
   "workerBrowserProfile": null,
   "timeoutSeconds": 150,
-  "env": {}
+  "env": {},
+  "viewerCommand": null,
+  "viewerAutoConnect": true
 }
 ```
 
@@ -421,6 +424,8 @@ set `allowPhysicalDesktop`, `allowWorkerUserBrowserProfiles`, `workerBrowserProf
 | `workerBrowserProfile` | `null` | User config only. A name: writing-role workers may also launch `pi-gui-chromium-agent-profile.desktop`, snap Chromium with that persistent agent-only profile (sign-ins kept across browsers and desktops, one desktop at a time). See [Agent browser profile](#agent-browser-profile-opt-in-persistent-sign-ins). |
 | `timeoutSeconds` | `150` | Pi's MCP request timeout. The first call of a session starts the private desktop (upstream allows 120 s). |
 | `env` | `{}` | Extra server environment (e.g. `RUST_LOG`). Physical-session variables are still removed. |
+| `viewerCommand` | `null` | User config only. The `/gui view` server; `null`: `krdpserver` on PATH, then `/usr/bin/krdpserver`. |
+| `viewerAutoConnect` | `true` | User config only. `/gui view` also opens an RDP client on your screen, connected to the viewer (see [Automatic connection](#automatic-connection)). `false`: only the connection details are printed. |
 
 Measured with Pi 1.0.2 and `cliproxyapi/claude-opus-5-5` (thinking low), one prompt each:
 
@@ -536,8 +541,10 @@ Procedure (worker stuck at a sign-in):
 
 1. The worker ends its assignment reporting that user sign-in is needed (its instructions say so; it leaves the app on
    that screen). It is now idle: give it no assignment while you operate its desktop.
-2. `/gui view W1` prints `127.0.0.1:<port>`, user `pi`, a one-time password and the certificate's SHA-256 fingerprint.
-3. Connect with an RDP client that decodes H.264, e.g.
+2. `/gui view W1` prints `127.0.0.1:<port>`, user `pi`, a one-time password and the certificate's SHA-256 fingerprint,
+   and opens an RDP client on your screen pointed at it ([Automatic connection](#automatic-connection)); the
+   message says which client it opened, or why it could not. Without one, continue with step 3.
+3. Connect by hand with an RDP client that decodes H.264, e.g.
    `xfreerdp3 /v:127.0.0.1:<port> /u:pi /sec:tls /gfx:avc420 /cert:fingerprint:sha256:<hex>` (asks for the password), or
    Remmina (snap/Flatpak): RDP profile, server `127.0.0.1:<port>`, user `pi`, Advanced > Security protocol negotiation
    "TLS protocol security", check the fingerprint. Not "Automatic" (NLA): krdp started with `--username/--password`
@@ -566,6 +573,34 @@ and gnome-remote-desktop needs Mutter. krdp listens on a chosen address and work
 
 Requirements: `sudo apt install krdp openssl` (or set `"viewerCommand"` in `~/.pi/agent/gui.config.json`, user config
 only).
+
+### Automatic connection
+
+Each `/gui view` (only that command; never `/gui status`, `/gui doctor`, a worker or a browser launch) also opens an RDP
+client on your own screen for the viewer it started or found (`src/client.ts`). The client runs with Pi's environment,
+i.e. in the graphical session Pi was started from, not inside the private desktop. Which client:
+
+1. A FreeRDP command-line client (`xfreerdp3`, `sdl-freerdp3`, `wlfreerdp3`, then the 2.x names) whose `/buildconfig` says
+   `WITH_GFX_H264=ON`: `/v:127.0.0.1:<port> /u:pi /p:<password> /sec:tls /gfx:avc420 /cert:fingerprint:sha256:<hex>`.
+   The password is a command-line argument there, as it already is for krdp.
+2. Otherwise Remmina, the snap first (`/snap/bin/remmina`; its bundled FreeRDP has H.264), else a `remmina` on PATH
+   (a distribution build may lack H.264 and be logged off right after sign-in, see Clients). pi-gui writes a profile
+   (`~/snap/remmina/common/pi-gui-view/<name>-<port>.remmina` for the snap, `$XDG_RUNTIME_DIR/pi-gui-view/` otherwise;
+   directory 0700, file 0600) with TLS security (not NLA), GFX AVC420, user `pi` and the password encrypted the way
+   Remmina stores profile passwords (3DES with the key from Remmina's own `remmina.pref`; whoever can read your Remmina
+   configuration can decrypt it). Without that key (Remmina never started) the profile has no password and Remmina asks.
+   The viewer's certificate is written to FreeRDP's certificate store of that Remmina for exactly `127.0.0.1:<port>`
+   (`.config/freerdp/server/127.0.0.1:<port>_<port>.pem`), so this certificate is accepted without a prompt and only it.
+   Then `remmina -c <profile>`; a running Remmina takes it over and opens the connection window.
+3. No graphical session (no `WAYLAND_DISPLAY`/`DISPLAY`, e.g. Pi over SSH), no client, or a client that does not start:
+   the message says why, and the manual steps above still apply. The viewer keeps running either way.
+
+The profile and the certificate entry are removed when the viewer stops (`/gui view stop`, the worker's end, session
+shutdown), each only if unchanged. Remmina keeps its own small state file (last connection time) in its cache. Your other
+profiles, certificates and the running Remmina are never changed or closed. A repeated `/gui view` opens the client again,
+except while the FreeRDP client it opened before still runs (a Remmina window cannot be watched: it belongs to Remmina's
+running instance). "Opened" means the client process started: whether sign-in and the picture work is up to the client
+(see Clients). `"viewerAutoConnect": false` in `~/.pi/agent/gui.config.json` turns this off.
 
 Clients: krdp streams only H.264 (AVC420) over the RDP graphics pipeline and drops clients that cannot decode it
 (krdp's own message: "Client does not support H.264 in YUV420 mode!"). What matters is the client's FreeRDP build
@@ -601,9 +636,11 @@ differs per distribution, release and packaging, so check the build you have:
 Security:
 - Loopback only (`--address=127.0.0.1`), a free port picked per start, user `pi`, a random 20-character password per
   viewer (new on every start), TLS with a fresh self-signed certificate whose fingerprint is printed so you can pin it.
-- The password is shown only in the `/gui view` output. It is never written to `gui.log` or any file (server output is
-  redacted). krdp takes it as a command-line argument, so local processes can read it from the process list while the
-  viewer runs: anyone with a shell on this machine could connect. Stop the viewer when you are done.
+- The password is shown only in the `/gui view` output. It is never written to `gui.log` (server output and client errors
+  are redacted). With [automatic connection](#automatic-connection) it is also in the Remmina profile (encrypted with
+  Remmina's own key, removed when the viewer stops) or on a FreeRDP client's command line. krdp takes it as a
+  command-line argument, so local processes can read it from the process list while the viewer runs: anyone with a
+  shell on this machine could connect. Stop the viewer when you are done.
 - The certificate and key live in a 0700 directory inside the private runtime directory and are deleted with the viewer.
 - Whoever connects controls the worker's desktop, with your files and network. Do not share the connection details.
 - While you operate the desktop the worker can still act on it if you give it an assignment; give it none until you stop.

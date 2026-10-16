@@ -17,6 +17,7 @@ import { NO_RUNTIME_DIR, type Backend } from "../src/backend.ts";
 import { createGuiExtension, type GuiExtensionOptions } from "../src/index.ts";
 import { checkPrerequisites } from "../src/prerequisites.ts";
 import { CAPABILITY_CHANNEL, type CapabilityProvider } from "../src/worker.ts";
+import type { RunningViewer } from "../src/viewer.ts";
 
 const fixture = fileURLToPath(new URL("./fixtures/fake-computer-use-mcp.mjs", import.meta.url));
 const fakeBackend: Backend = { source: "config", command: process.execPath, prefix: [fixture], mcpArgs: ["--compact-tools"], label: "fake" };
@@ -445,12 +446,20 @@ test("/gui view: a worker's private desktop over loopback RDP, stopped with the 
   const krdp = join(bin, "krdpserver");
   await writeFile(krdp, `#!/bin/sh\nexport FAKE_KRDP_RECORD=${JSON.stringify(record)}\nexec ${JSON.stringify(process.execPath)} ${JSON.stringify(fakeKrdpScript)} "$@"\n`, { mode: 0o755 });
   const viewerReady = () => ({ ok: true, checks: [], missing: [], krdp, openssl: "/usr/bin/openssl" });
+  // Never a real client on the user's screen: a fake connect records what /gui view asked for.
+  const connects: { kind: string; port: number; password: string; certificate?: string }[] = [];
+  const cleaned: number[] = [];
+  const connect = async (viewer: RunningViewer, kind: "started" | "running") => {
+    connects.push({ kind, port: viewer.port, password: viewer.password, ...(viewer.certificate ? { certificate: viewer.certificate } : {}) });
+    (viewer.cleanups ??= []).push(() => cleaned.push(viewer.port));
+    return { ok: true as const, client: "FakeRDP (/fake/rdp)", detail: `TLS pinned; profile /fake/${viewer.port}.remmina` };
+  };
   let api: ExtensionAPI | undefined;
   const cfg = await mkdtemp(join(tmpdir(), "pi-gui-cfg-"));
   await writeFile(join(cfg, "gui.config.json"), JSON.stringify({ env: { XDG_DATA_DIRS: await workerApps() } }));
   const main = await startSession([
     noMcpJson(), pi => { api = pi; },
-    createGuiExtension({ snapChromium: noSnap, agentDir: cfg, resolve: resolveFake, prerequisites: ready, viewer: { prerequisites: viewerReady } }),
+    createGuiExtension({ snapChromium: noSnap, agentDir: cfg, resolve: resolveFake, prerequisites: ready, viewer: { prerequisites: viewerReady, connect } }),
   ], []);
   const notes: { text: string; level?: string }[] = [];
   const gui = main.session.extensionRunner.getCommand("gui")!;
@@ -471,6 +480,7 @@ test("/gui view: a worker's private desktop over loopback RDP, stopped with the 
   ], { tools: ["read", ...provider.tools] });
   assert.match((await command("view list")).text, /main, W1/);
   assert.match((await command("view W1")).text, /has not started yet/, "no desktop before the worker's first GUI call");
+  assert.equal(connects.length, 0, "no client without a viewer");
   await worker.session.prompt("launch");
 
   const opened = await command("view");
@@ -486,16 +496,25 @@ test("/gui view: a worker's private desktop over loopback RDP, stopped with the 
   assert.match(seen.env.XDG_RUNTIME_DIR, /computer-use-mcp-isolated-/, "the viewer joined the worker's private session");
   assert.match(seen.env.WAYLAND_DISPLAY, /^wayland-virtual-\d+$/);
   assert.equal(seen.env.DISPLAY, null);
+  // Auto-connect: /gui view opened the client for exactly this viewer, with its certificate to pin.
+  assert.deepEqual(connects.map(item => [item.kind, item.port, item.password]), [["started", port, password]]);
+  assert.ok(connects[0]!.certificate && existsSync(connects[0]!.certificate), "the client gets the viewer's certificate");
+  assert.match(opened.text, /RDP client: opened FakeRDP \(\/fake\/rdp\) on your screen for 127\.0\.0\.1:\d+/);
+  assert.match(opened.text, /kept only in the client's profile, removed when the viewer stops/);
+  assert.match(opened.text, /xfreerdp3 \/v:127\.0\.0\.1:\d+/, "the manual way stays in the message");
   const again = await command("view W1");
   assert.match(again.text, /Already running/);
   assert.ok(again.text.includes(`127.0.0.1:${port}`) && again.text.includes(password!), "the same connection again");
+  assert.deepEqual(connects.map(item => item.kind), ["started", "running"], "a repeated /gui view asks for the client again (closed window)");
   assert.match((await command("status")).text, new RegExp(`W1 \\(viewer on 127\\.0\\.0\\.1:${port}\\)`));
   assert.doesNotMatch(readFileSync(join(cfg, "gui.log"), "utf8"), new RegExp(password!), "the password is not logged");
   assert.match(readFileSync(join(cfg, "gui.log"), "utf8"), /view W1: krdp pid \d+ listening on 127\.0\.0\.1:\d+/);
+  assert.match(readFileSync(join(cfg, "gui.log"), "utf8"), /view W1: opened FakeRDP/);
 
   // Stop and reopen: a new port and password; then the worker ends and takes its viewer with it.
   assert.match((await command("view stop")).text, /Stopped the viewer of W1/);
   assert.equal(isAlive(seen.pid), false);
+  assert.deepEqual(cleaned, [port, port], "stopping the viewer removed what the client was given (once per connect)");
   const reopened = await command("view W1");
   assert.match(reopened.text, /Started a remote desktop/);
   const second = JSON.parse(readFileSync(record, "utf8"));
@@ -505,6 +524,7 @@ test("/gui view: a worker's private desktop over loopback RDP, stopped with the 
   while (isAlive(second.pid) && Date.now() < deadline) await sleep(50);
   assert.equal(isAlive(second.pid), false, "the worker's session shutdown stopped its viewer");
   assert.equal(existsSync(second.env.TMPDIR), false, "its certificate directory is gone");
+  assert.equal(cleaned.at(-1), Number(second.options.port), "the worker's end ran the client cleanup too");
   assert.match((await command("view W1")).text, /no GUI desktop named "W1"/);
 });
 
@@ -517,10 +537,11 @@ test("/gui view: while a viewer runs, act paste reaches the server as typing; lo
   await writeFile(krdp, `#!/bin/sh\nexport FAKE_KRDP_RECORD=${JSON.stringify(join(bin, "record.json"))}\nexec ${JSON.stringify(process.execPath)} ${JSON.stringify(fakeKrdpScript)} "$@"\n`, { mode: 0o755 });
   let api: ExtensionAPI | undefined;
   const cfg = await mkdtemp(join(tmpdir(), "pi-gui-cfg-"));
-  await writeFile(join(cfg, "gui.config.json"), JSON.stringify({ env: { XDG_DATA_DIRS: await workerApps() } }));
+  await writeFile(join(cfg, "gui.config.json"), JSON.stringify({ env: { XDG_DATA_DIRS: await workerApps() }, viewerAutoConnect: false }));
+  let connected = 0;
   const main = await startSession([
     noMcpJson(), pi => { api = pi; },
-    createGuiExtension({ snapChromium: noSnap, agentDir: cfg, resolve: resolveFake, prerequisites: ready, viewer: { prerequisites: () => ({ ok: true, checks: [], missing: [], krdp, openssl: "/usr/bin/openssl" }) } }),
+    createGuiExtension({ snapChromium: noSnap, agentDir: cfg, resolve: resolveFake, prerequisites: ready, viewer: { prerequisites: () => ({ ok: true, checks: [], missing: [], krdp, openssl: "/usr/bin/openssl" }), connect: async () => { connected++; return { skipped: "test" }; } } }),
   ], []);
   const gui = main.session.extensionRunner.getCommand("gui")!;
   const notes: { text: string; level?: string }[] = [];
@@ -545,7 +566,11 @@ test("/gui view: while a viewer runs, act paste reaches the server as typing; lo
     fauxAssistantMessage("viewer off"),
   ], { tools: provider!.tools });
   await worker.session.prompt("start");
-  assert.equal((await command("view W1")).level, "info");
+  const viewed = await command("view W1");
+  assert.equal(viewed.level, "info");
+  assert.equal(connected, 0, "viewerAutoConnect: false opens no client");
+  assert.match(viewed.text, /RDP client: not opened automatically \("viewerAutoConnect": false/);
+  assert.match(viewed.text, /not saved anywhere/);
   await worker.session.prompt("paste with the viewer");
   const [, typed, refused, clicked] = results(worker.session);
   assert.equal(typed!.isError, false, typed!.text);
@@ -571,7 +596,7 @@ test("/gui view: missing krdp gives the install command", async () => {
   const missing = () => ({ ok: false, checks: [{ name: "krdpserver (KDE RDP server)", ok: false, detail: "not found", apt: "krdp" }], missing: ["krdpserver (KDE RDP server) (apt: krdp)"] });
   const { session } = await startSession([
     noMcpJson(),
-    createGuiExtension({ snapChromium: noSnap, agentDir: await mkdtemp(join(tmpdir(), "pi-gui-cfg-")), resolve: resolveFake, prerequisites: ready, viewer: { prerequisites: missing } }),
+    createGuiExtension({ snapChromium: noSnap, agentDir: await mkdtemp(join(tmpdir(), "pi-gui-cfg-")), resolve: resolveFake, prerequisites: ready, viewer: { prerequisites: missing, connect: async () => { throw new Error("no client without a viewer"); } } }),
   ], []);
   const notes: { text: string; level?: string }[] = [];
   const gui = session.extensionRunner.getCommand("gui")!;

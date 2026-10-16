@@ -303,6 +303,12 @@ export interface RunningViewer {
   exitPromise: Promise<void>;
   /** The server's recent output, password redacted (never written to disk). */
   output: string[];
+  /** The viewer's TLS certificate (PEM), in its scratch directory. */
+  certificate?: string;
+  /** Run once when the viewer stops (files an auto-connected client was given). */
+  cleanups?: (() => void)[];
+  /** The RDP client process `/gui view` opened for this viewer, if it is ours to watch. */
+  clientPid?: number;
 }
 
 export interface StartDeps {
@@ -392,6 +398,7 @@ async function launch(
   const viewer: RunningViewer = {
     target, session, pid: child.pid!, host: VIEW_HOST, port: options.port, user: VIEW_USER, password: options.password,
     fingerprint: options.fingerprint, scratchDir: options.scratchDir, startedAt: Date.now(), child, exitPromise, output,
+    certificate: options.certificate,
   };
   void exitPromise.then(() => { viewer.exited = exited; });
   return { viewer };
@@ -412,12 +419,20 @@ export async function stopViewer(viewer: RunningViewer, graceMs = 3_000): Promis
       await Promise.race([viewer.exitPromise, new Promise(resolve => setTimeout(resolve, 2_000).unref())]);
     }
   }
+  runCleanups(viewer);
   rmSync(viewer.scratchDir, { recursive: true, force: true });
+}
+
+/** The viewer's cleanups, each once, best effort. */
+export function runCleanups(viewer: Pick<RunningViewer, "cleanups">): void {
+  const cleanups = viewer.cleanups?.splice(0) ?? [];
+  for (const cleanup of cleanups) { try { cleanup(); } catch { /* best effort */ } }
 }
 
 /** On process exit: synchronous, best effort. */
 export function killViewerSync(viewer: RunningViewer): void {
   if (!viewer.exited) killGroup(viewer.pid, "SIGKILL");
+  runCleanups(viewer);
   try { rmSync(viewer.scratchDir, { recursive: true, force: true }); } catch { /* best effort */ }
 }
 
@@ -438,11 +453,22 @@ export interface RegistryDeps {
   find: (tag: string) => SessionLookup;
   start: (target: string, session: PrivateSession) => Promise<RunningViewer>;
   stop?: (viewer: RunningViewer) => Promise<void>;
+  /**
+   * Open an RDP client for the viewer (`/gui view` auto-connect). Runs inside the target's exclusive section, so a stop
+   * or release that follows waits for it and then removes what it set up.
+   */
+  connect?: (viewer: RunningViewer, kind: "started" | "running") => Promise<ClientOutcome>;
   log?: (line: string) => void;
 }
 
+/** What auto-connect did: opened a client (process started; whether the RDP login and picture work is up to the client). */
+export type ClientOutcome =
+  | { ok: true; client: string; detail: string }
+  | { ok: false; reason: string }
+  | { skipped: string };
+
 export type ViewOutcome =
-  | { kind: "started" | "running"; viewer: RunningViewer; replaced?: boolean }
+  | { kind: "started" | "running"; viewer: RunningViewer; replaced?: boolean; client?: ClientOutcome }
   | { kind: "error"; message: string };
 
 /**
@@ -525,7 +551,7 @@ export class ViewRegistry {
       const lookup = this.deps.find(target.tag);
       const current = target.viewer;
       if (current && !current.exited && lookup.ok && lookup.session.runtimeDir === current.session.runtimeDir && lookup.session.display === current.session.display) {
-        return { kind: "running", viewer: current };
+        return { kind: "running", viewer: current, ...await this.connect(target, current, "running") };
       }
       let replaced = false;
       if (current) {
@@ -542,12 +568,26 @@ export class ViewRegistry {
         void viewer.exitPromise.then(() => {
           if (target.viewer === viewer) this.deps.log?.(`view ${target.name}: viewer exited (${viewer.exited?.code ?? viewer.exited?.signal ?? "?"})`);
         });
-        return { kind: "started", viewer, replaced };
+        return { kind: "started", viewer, replaced, ...await this.connect(target, viewer, "started") };
       } catch (error) {
         this.deps.log?.(`view ${target.name}: failed: ${(error as Error).message}`);
         return { kind: "error", message: `${target.name}: ${(error as Error).message}` };
       }
     });
+  }
+
+  private async connect(target: ViewTarget, viewer: RunningViewer, kind: "started" | "running"): Promise<{ client?: ClientOutcome }> {
+    if (!this.deps.connect) return {};
+    let client: ClientOutcome;
+    try {
+      client = await this.deps.connect(viewer, kind);
+    } catch (error) {
+      client = { ok: false, reason: (error as Error).message };
+    }
+    if ("skipped" in client) this.deps.log?.(`view ${target.name}: client not opened (${client.skipped})`);
+    else if (client.ok) this.deps.log?.(`view ${target.name}: opened ${client.client}`);
+    else this.deps.log?.(`view ${target.name}: could not open a client: ${redact(client.reason, viewer.password)}`);
+    return { client };
   }
 
   /** Stop the viewer of one target (after a start in progress); true when there was one. */
@@ -583,16 +623,23 @@ export class ViewRegistry {
 }
 
 /** The message `/gui view` prints: where to connect, with what, and how to finish. */
-export function connectionMessage(viewer: RunningViewer, kind: "started" | "running", options: { replaced?: boolean } = {}): string {
+export function connectionMessage(viewer: RunningViewer, kind: "started" | "running", options: { replaced?: boolean; client?: ClientOutcome } = {}): string {
   const address = `${viewer.host}:${viewer.port}`;
   const hex = fingerprintHex(viewer.fingerprint);
   const isWorker = viewer.target !== "main";
+  const client = options.client;
+  const clientLines = !client ? []
+    : "skipped" in client ? [`RDP client: not opened automatically (${client.skipped}).`]
+    : client.ok ? [`RDP client: opened ${client.client} on your screen for ${address} (${redact(client.detail, viewer.password)}). If no window appears or the login fails, connect by hand as below.`]
+    : [`RDP client: could not open one automatically: ${redact(client.reason, viewer.password)}. Connect by hand:`];
+  const saved = client && !("skipped" in client) && client.ok && /profile /.test(client.detail) ? "kept only in the client's profile, removed when the viewer stops" : "not saved anywhere";
   return [
     `${kind === "started" ? (options.replaced ? "Restarted the" : "Started a") : "Already running:"} remote desktop (RDP, krdp) for ${viewer.target}'s private desktop ${viewer.session.display}. Local connections only; it stops with /gui view stop ${viewer.target}${isWorker ? " or when the worker ends" : ""}.`,
     `  Address:   ${address}`,
     `  User:      ${viewer.user}`,
-    `  Password:  ${viewer.password}   (one-time, for this viewer only; not saved anywhere)`,
+    `  Password:  ${viewer.password}   (one-time, for this viewer only; ${saved})`,
     `  TLS:       self-signed, SHA-256 ${viewer.fingerprint}`,
+    ...clientLines,
     "Connect with an RDP client that decodes H.264 (krdp streams only H.264/AVC420; distribution FreeRDP builds, and the Remmina/KRDC that use them, may lack it: /gui doctor checks FreeRDP command-line clients, README > Clients covers Remmina):",
     `  xfreerdp3 /v:${address} /u:${viewer.user} /sec:tls /gfx:avc420 /cert:fingerprint:sha256:${hex}   (FreeRDP with H.264; asks for the password)`,
     `  Remmina (snap: \`snap run remmina\`, or Flatpak with the openh264 extension): new RDP profile, server ${address}, user ${viewer.user}, Advanced > Security protocol negotiation "TLS protocol security" (not "Automatic"/NLA: krdp cannot check passwords over NLA, so every login fails and the password prompt returns); accept the certificate whose fingerprint matches.`,
