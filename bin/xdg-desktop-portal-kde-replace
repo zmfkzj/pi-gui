@@ -5,5 +5,7 @@
 # On the private session bus, D-Bus activation can start a backend before the runner does: KWin's Qt platform
 # registers with the portal at startup, which activates xdg-desktop-portal and its KDE backend. The runner's own start
 # then cannot take the bus name and the session fails with "portal_backend exited during startup". --replace takes the
-# name over. Every process of the private session, the activated one included, is stopped at teardown.
+# name over. Every process of the private session, the activated one included, is stopped at teardown. The activated
+# start itself goes through bin/xdg-desktop-portal-kde-activated (registered by bin/private-dbus-daemon), which waits for
+# the private Wayland socket and does not use --replace, so it never takes the name from this start.
 exec "${PI_GUI_PORTAL_BACKEND:?pi-gui: PI_GUI_PORTAL_BACKEND is not set}" --replace "$@"

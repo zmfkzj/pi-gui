@@ -9,7 +9,7 @@ import {
 } from "../src/backend.ts";
 import { DEFAULT_GUI_CONFIG, loadGuiConfig, validateGuiConfig } from "../src/config.ts";
 import { desktopGuidance, routeToolCall, sessionOf, TYPE_EVENT_MAX } from "../src/policy.ts";
-import { checkPrerequisites, doctorStatuses, KWIN_PLUGINS, PORTAL_BACKEND_WRAPPER, RUNNER_PROGRAMS } from "../src/prerequisites.ts";
+import { checkPrerequisites, DBUS_DAEMON_WRAPPER, doctorStatuses, KWIN_PLUGINS, PORTAL_BACKEND_WRAPPER, RUNNER_PROGRAMS } from "../src/prerequisites.ts";
 
 const config = (patch = {}) => ({ ...DEFAULT_GUI_CONFIG, env: {}, ...patch });
 
@@ -161,15 +161,33 @@ test("prerequisites mirror the runner's lookup, overrides included", () => {
   const missing = checkPrerequisites(undefined, { ...base, env: { PATH: "/nowhere" }, libexecDirs: () => [] });
   assert.equal(missing.ok, false);
   assert.deepEqual(missing.missing, ["xdg-desktop-portal-kde (apt: xdg-desktop-portal-kde)"]);
-  // Ubuntu installs the KDE portal backend in multiarch libexec, which the runner does not search; it is started with --replace.
+  // Ubuntu installs the KDE portal backend in multiarch libexec, which the runner does not search; it is started with
+  // --replace, and the private dbus-daemon goes through pi-gui's wrapper, whose bus activates that backend only once
+  // the private Wayland socket exists (a backend started before it aborts: the reported apport crash).
   present.add("/usr/lib/x86_64-linux-gnu/libexec/xdg-desktop-portal-kde");
   const multiarch = checkPrerequisites(undefined, { ...base, env: { PATH: "/nowhere" }, libexecDirs: () => ["/usr/lib/x86_64-linux-gnu/libexec"] });
   assert.equal(multiarch.ok, true, multiarch.missing.join());
-  assert.deepEqual(multiarch.overrides, { COMPUTER_USE_MCP_PORTAL_BACKEND_BIN: PORTAL_BACKEND_WRAPPER, PI_GUI_PORTAL_BACKEND: "/usr/lib/x86_64-linux-gnu/libexec/xdg-desktop-portal-kde" });
+  assert.deepEqual(multiarch.overrides, {
+    COMPUTER_USE_MCP_PORTAL_BACKEND_BIN: PORTAL_BACKEND_WRAPPER, PI_GUI_PORTAL_BACKEND: "/usr/lib/x86_64-linux-gnu/libexec/xdg-desktop-portal-kde",
+    COMPUTER_USE_MCP_DBUS_DAEMON_BIN: DBUS_DAEMON_WRAPPER, PI_GUI_DBUS_DAEMON: "/usr/bin/dbus-daemon",
+  });
+  assert.match(multiarch.checks.find(check => check.name === "dbus-daemon")!.detail, /private-dbus-daemon: the KDE portal backend's D-Bus activation waits/);
+  // A user's own dbus-daemon is used as it is; the portal backend still gets the --replace wrapper.
+  const ownDaemon = checkPrerequisites(undefined, { ...base, env: { PATH: "/nowhere", COMPUTER_USE_MCP_DBUS_DAEMON_BIN: "/usr/bin/dbus-daemon" }, libexecDirs: () => ["/usr/lib/x86_64-linux-gnu/libexec"] });
+  assert.deepEqual(ownDaemon.overrides, { COMPUTER_USE_MCP_PORTAL_BACKEND_BIN: PORTAL_BACKEND_WRAPPER, PI_GUI_PORTAL_BACKEND: "/usr/lib/x86_64-linux-gnu/libexec/xdg-desktop-portal-kde" });
+  // pi-gui's dbus-daemon wrapper is not used without an executable dbus-daemon.
+  present.delete("/usr/bin/dbus-daemon");
+  const noDaemon = checkPrerequisites(undefined, { ...base, env: { PATH: "/nowhere" }, libexecDirs: () => ["/usr/lib/x86_64-linux-gnu/libexec"] });
+  assert.deepEqual(noDaemon.missing, ["dbus-daemon (apt: dbus-daemon)"]);
+  assert.equal(noDaemon.overrides.COMPUTER_USE_MCP_DBUS_DAEMON_BIN, undefined);
+  present.add("/usr/bin/dbus-daemon");
   present.delete("/usr/lib/x86_64-linux-gnu/libexec/xdg-desktop-portal-kde");
+  // A user's own portal backend (alone, or with their own dbus-daemon) keeps its default activation: no override at all.
   const overridden = checkPrerequisites(undefined, { ...base, env: { PATH: "/nowhere", COMPUTER_USE_MCP_PORTAL_BACKEND_BIN: "/opt/kde/portal-kde" }, libexecDirs: () => [] });
   assert.equal(overridden.ok, true);
   assert.deepEqual(overridden.overrides, {}, "a user override is used as it is");
+  const both = checkPrerequisites(undefined, { ...base, env: { PATH: "/nowhere", COMPUTER_USE_MCP_PORTAL_BACKEND_BIN: "/opt/kde/portal-kde", COMPUTER_USE_MCP_DBUS_DAEMON_BIN: "/usr/bin/dbus-daemon" }, libexecDirs: () => [] });
+  assert.deepEqual(both.overrides, {});
   assert.equal(RUNNER_PROGRAMS.length + KWIN_PLUGINS.length, overridden.checks.length - 1);
   // kwin-wayland without kwin-common: no screencast/EIS plugins, so no screenshots or input.
   const noPlugins = checkPrerequisites(undefined, { ...base, exists: () => false, env: { PATH: "/nowhere", COMPUTER_USE_MCP_PORTAL_BACKEND_BIN: "/opt/kde/portal-kde" }, libexecDirs: () => [] });

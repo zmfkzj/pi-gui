@@ -1,0 +1,30 @@
+#!/bin/sh
+# Start the private session's dbus-daemon (pi-gui passes this script to computer-use-mcp's private-session runner as
+# COMPUTER_USE_MCP_DBUS_DAEMON_BIN and the real program as PI_GUI_DBUS_DAEMON).
+#
+# Before the daemon starts, it registers bin/xdg-desktop-portal-kde-activated as the KDE portal backend's activation
+# on this bus only: a service file in $XDG_RUNTIME_DIR/dbus-1/services, the runner's private 0700 runtime directory,
+# which dbus-daemon searches first and the runner deletes at teardown. The backend activated through the system's
+# service file can start before KWin's Wayland socket exists and then aborts (see that script). Nothing outside the
+# private runtime directory is written; anywhere else (no runner marker, no pi-gui portal backend) the daemon starts
+# unchanged.
+daemon="${PI_GUI_DBUS_DAEMON:?pi-gui: PI_GUI_DBUS_DAEMON is not set}"
+activated="$(dirname -- "$0")/xdg-desktop-portal-kde-activated"
+runtime="${XDG_RUNTIME_DIR:-}"
+if [ "${COMPUTER_USE_MCP_ISOLATED:-}" = 1 ] && [ -n "$runtime" ] && [ "${COMPUTER_USE_MCP_ISOLATION_MARKER:-}" = "$runtime/isolation.ready" ] \
+  && [ -d "$runtime" ] && [ -O "$runtime" ] && [ -n "${PI_GUI_PORTAL_BACKEND:-}" ] && [ -x "$activated" ]; then
+  newline='
+'
+  case "$activated" in
+    [!/]* | *"'"* | *"$newline"*)
+      # The Exec line is single-quoted (dbus-daemon unquotes it like a shell; spaces are fine) and cannot carry a quote.
+      echo "pi-gui: $activated cannot be written as a D-Bus Exec line; the KDE portal backend keeps its default activation" >&2 ;;
+    *)
+      services="$runtime/dbus-1/services"
+      if (umask 077 && mkdir -p -- "$services" && printf "[D-BUS Service]\nName=org.freedesktop.impl.portal.desktop.kde\nExec='%s'\n" "$activated" \
+        >"$services/org.freedesktop.impl.portal.desktop.kde.service"); then :; else
+        echo "pi-gui: could not register the KDE portal backend's activation in $services" >&2
+      fi ;;
+  esac
+fi
+exec "$daemon" "$@"

@@ -1,0 +1,28 @@
+#!/bin/sh
+# D-Bus activation of the KDE portal backend on a pi-gui private session bus (registered by bin/private-dbus-daemon).
+#
+# KWin asks the portal for its app ID while Qt starts, before it has created its Wayland socket. That request activates
+# xdg-desktop-portal, which activates this backend. Started at once (the system's service file), the backend's Qt finds
+# no Wayland display ("Failed to create wl_display"), aborts with SIGABRT, and Ubuntu's apport shows an
+# "xdg-desktop-portal-kde has stopped unexpectedly" dialog on the user's own screen. Here the backend starts only once
+# the private display's socket exists; if it never appears within the runner's startup timeout, the activation fails
+# with a message instead of a crash. No --replace: the runner's own start (bin/xdg-desktop-portal-kde-replace) takes
+# the name over, never this one.
+backend="${PI_GUI_PORTAL_BACKEND:?pi-gui: PI_GUI_PORTAL_BACKEND is not set}"
+case "${WAYLAND_DISPLAY:-}" in
+  "") echo "pi-gui: no WAYLAND_DISPLAY for the KDE portal backend; not starting it" >&2; exit 1 ;;
+  /*) socket="$WAYLAND_DISPLAY" ;;
+  *) socket="${XDG_RUNTIME_DIR:?pi-gui: XDG_RUNTIME_DIR is not set}/$WAYLAND_DISPLAY" ;;
+esac
+timeout="${COMPUTER_USE_MCP_STARTUP_TIMEOUT_SECS:-15}"
+case "$timeout" in ""|*[!0-9]*) timeout=15 ;; esac
+tries=$((timeout * 20))
+while [ ! -S "$socket" ]; do
+  if [ "$tries" -le 0 ]; then
+    echo "pi-gui: Wayland socket $socket was not created within ${timeout} s; not starting the KDE portal backend" >&2
+    exit 1
+  fi
+  tries=$((tries - 1))
+  sleep 0.05
+done
+exec "$backend" "$@"

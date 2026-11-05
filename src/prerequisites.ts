@@ -55,6 +55,12 @@ export function qtPluginDirs(env: NodeJS.ProcessEnv = process.env): string[] {
 
 /** This package's wrapper that starts the KDE portal backend with `--replace` (see the script). */
 export const PORTAL_BACKEND_WRAPPER = fileURLToPath(new URL("../bin/xdg-desktop-portal-kde-replace", import.meta.url));
+/**
+ * This package's wrapper of the private session's dbus-daemon. It makes the KDE portal backend's D-Bus activation on
+ * that bus wait for the private Wayland socket (`bin/xdg-desktop-portal-kde-activated`): started at once, before KWin
+ * created the socket, the backend aborts (SIGABRT) and apport reports a crash on the user's screen.
+ */
+export const DBUS_DAEMON_WRAPPER = fileURLToPath(new URL("../bin/private-dbus-daemon", import.meta.url));
 
 export interface Check {
   name: string;
@@ -72,7 +78,8 @@ export interface PrerequisiteReport {
   /**
    * Environment for the private-session runner, passed to the server: program overrides (`COMPUTER_USE_MCP_*_BIN`) for
    * programs the runner would not find (Ubuntu's multiarch libexec) or must start differently (the KDE portal backend,
-   * through {@link PORTAL_BACKEND_WRAPPER}). The runner honours them; a user's own override is left alone.
+   * through {@link PORTAL_BACKEND_WRAPPER}, and dbus-daemon, through {@link DBUS_DAEMON_WRAPPER}). The runner honours them;
+   * a user's own override is left alone.
    */
   overrides: Record<string, string>;
   /** The physical session, for information: private mode needs none. */
@@ -116,6 +123,13 @@ export function checkPrerequisites(backend: Backend | undefined, deps: Prerequis
       overrides[program.override] = PORTAL_BACKEND_WRAPPER;
       overrides.PI_GUI_PORTAL_BACKEND = found;
       detail = `${found} (started with --replace through ${PORTAL_BACKEND_WRAPPER})`;
+    }
+    // Only with pi-gui's own portal backend (a user's backend override keeps its own activation), and only when the
+    // user has not overridden dbus-daemon.
+    if (found && !override && program.name === "dbus-daemon" && overrides.PI_GUI_PORTAL_BACKEND) {
+      overrides[program.override] = DBUS_DAEMON_WRAPPER;
+      overrides.PI_GUI_DBUS_DAEMON = found;
+      detail = `${found} (through ${DBUS_DAEMON_WRAPPER}: the KDE portal backend's D-Bus activation waits for the private Wayland display)`;
     }
     checks.push({
       name: program.name,

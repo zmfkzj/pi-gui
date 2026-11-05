@@ -56,13 +56,24 @@ nothing is downloaded at run time. It is optional: other platforms install witho
 `computer-use-mcp` on PATH (`cargo install --locked --git https://github.com/mirsella/computer-use-mcp computer-use-mcp`),
 then `npx -y @mirsella/opencode-computer-use-mcp@0.6.0`. Pi's own packages are peer dependencies and are not bundled.
 
-Two distribution details are handled through the runner's documented program overrides (`COMPUTER_USE_MCP_*_BIN`), not by
+Three distribution details are handled through the runner's documented program overrides (`COMPUTER_USE_MCP_*_BIN`), not by
 changing upstream:
 
 - Ubuntu installs the KDE portal backend in `/usr/lib/x86_64-linux-gnu/libexec`, which the runner does not search.
 - On the private bus, D-Bus activation can start the KDE portal backend before the runner does (KWin's Qt platform
   registers with the portal at startup), and the runner's own start then fails with "portal_backend exited during
   startup". pi-gui starts it through `bin/xdg-desktop-portal-kde-replace` (`--replace`). A user's own override wins.
+- That activation can also come before KWin has created its Wayland socket. The backend's Qt then finds no display
+  ("Failed to create wl_display") and aborts, and on Ubuntu apport shows "xdg-desktop-portal-kde has stopped
+  unexpectedly" on your own screen, although the private desktop starts fine a second later. pi-gui therefore starts the
+  private session's dbus-daemon through `bin/private-dbus-daemon`, which registers `bin/xdg-desktop-portal-kde-activated`
+  as the backend's activation on that bus only (a service file in the runner's private 0700 runtime directory, which
+  dbus-daemon searches first and the runner deletes). It starts the backend, without `--replace`, once the socket
+  exists, or fails cleanly after the runner's startup timeout (`COMPUTER_USE_MCP_STARTUP_TIMEOUT_SECS`, 15 s). Only
+  with pi-gui's own portal backend and dbus-daemon: your own `COMPUTER_USE_MCP_PORTAL_BACKEND_BIN` or
+  `COMPUTER_USE_MCP_DBUS_DAEMON_BIN` keeps the default activation. The socket's existence is what is waited for, not
+  KWin's full readiness. An install path containing `'` cannot be written as the service's `Exec` line and also keeps
+  the default activation (with a message in the private bus log).
 
 ## Use
 
